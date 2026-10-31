@@ -335,7 +335,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshSmall:0.33,smallH:0.1,confirmSmall:3,show:0.3,sure:0.7,matchIou:0.25,lowIou:0.35,ttl:800,ttlEst:1500,confirm:2,establish:3,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:1.5,histMs:1200,replayMs:700,minStep:24,globalR:6,trackR:3,stale:400,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshSmall:0.33,smallH:0.1,confirmSmall:2,show:0.3,sure:0.7,matchIou:0.25,lowIou:0.35,ttl:800,ttlEst:1500,confirm:2,establish:3,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -436,10 +436,19 @@ function createTracker(o){
     if(prev){
       const g=global(prev,cur,w,h,now-prev.t);
       cur.gdx=g[0];cur.gdy=g[1];
+      const prev2=T.frames[T.frames.length-2];
       for(const t of T.tracks){
         const lh=t.hist[t.hist.length-1];
-        const [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
-        t.pos[0]+=dx;t.pos[1]+=dy;t.box[0]+=dx;t.box[1]+=dy;
+        let [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
+        if(prev2&&lh&&lh.t===prev.t&&Math.hypot(dx,dy)<T.scale&&Math.hypot(lh.dx,lh.dy)<T.scale){
+          const b2=[t.pos[0]-lh.dx,t.pos[1]-lh.dy,t.pos[2],t.pos[3]];
+          const g2x=(prev.gdx||0)+(cur.gdx||0),g2y=(prev.gdy||0)+(cur.gdy||0);
+          const m2=step(prev2,cur,b2,g2x,g2y,(lh.dx+dx)/T.scale,(lh.dy+dy)/T.scale);
+          dx=m2[0]-lh.dx;dy=m2[1]-lh.dy;
+        }
+        t.pos[0]+=dx;t.pos[1]+=dy;
+        const sd=Math.max(1,now-prev.t);
+        t.vel=[dx/sd,dy/sd];t.velT=now;
         t.hist.push({t:now,dx,dy});
         while(t.hist.length&&t.hist[0].t<now-P.histMs)t.hist.shift();
       }
@@ -562,6 +571,13 @@ function createTracker(o){
       }
       tr.push({id:T.nextId++,cls:d.cls,grp:d.grp,votes:{[d.cls]:d.score},pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,peak:d.score,hits:1,miss:0,part:0,small,lastSeen:now});
     });
+    for(let i=0;i<tr.length;i++)for(let j=tr.length-1;j>i;j--){
+      const a=tr[i],b=tr[j];
+      if(a.grp!==b.grp||iou(a.pos,b.pos)<P.mergeIou)continue;
+      const keep=(a.hits>=b.hits)?a:b,drop=keep===a?b:a;
+      keep.score=Math.max(keep.score,drop.score);keep.peak=Math.max(keep.peak,drop.peak);
+      tr.splice(tr.indexOf(drop),1);if(drop===a){i--;break;}
+    }
     T.tracks=tr.filter(t=>{
       const fw=T.w*T.scale,fh=T.h*T.scale;
       const vis=fw&&fh?inside(t.pos,[0,0,fw,fh]):1;
@@ -578,6 +594,7 @@ function createTracker(o){
 
   function smooth(now,dt){
     for(const t of T.tracks){
+      if(t.vel&&now-t.velT<150){t.box[0]+=t.vel[0]*dt;t.box[1]+=t.vel[1]*dt;}
       const rx=t.pos[0]-t.box[0],ry=t.pos[1]-t.box[1];
       const r=Math.hypot(rx,ry);
       if(r<P.dead){t.box[0]=t.pos[0];t.box[1]=t.pos[1];}
@@ -611,8 +628,9 @@ async function detectLoop(det){
   while(running&&detectors.includes(det)){
     if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)){await sleep(50);continue;}
     cycle++;
-    const hasSmall=tracker.tracks.some(t=>visible(t)&&t.box[3]<0.15*clean.height);
-    const focus=FOCUS&&(hasSmall?(detectors.length>1?(idx>0&&cycle%2===0):(cycle%3===0)):(cycle%4===0));
+    const vis=tracker.tracks.filter(visible);
+    const hasSmall=vis.some(t=>t.box[3]<0.15*clean.height),hasLarge=vis.some(t=>t.box[3]>=0.3*clean.height);
+    const focus=FOCUS&&!recorder&&(hasSmall?(detectors.length>1?(idx>0&&cycle%2===0):(cycle%3===0)):(hasLarge?(cycle%4===0):(detectors.length>1?(idx>0&&cycle%2===0):(cycle%2===0))));
     const g=grabFrame(focus);
     const ts=cleanTs;
     try{
@@ -738,20 +756,13 @@ async function deliver(file,url){
   return true;
 }
 
-function dataUrlToFile(u,name,type){
-  const b=atob(u.slice(u.indexOf(',')+1));
-  const arr=new Uint8Array(b.length);
-  for(let i=0;i<b.length;i++)arr[i]=b.charCodeAt(i);
-  return new File([arr],name,{type});
-}
 
 shot.addEventListener('click',()=>{
   if(!running||!canvas.width)return;
   flash.style.opacity='0.85';
   setTimeout(()=>{flash.style.opacity='0';},70);
-  const dataUrl=canvas.toDataURL('image/jpeg',0.92);
-  const file=dataUrlToFile(dataUrl,'detect_'+stamp()+'.jpg','image/jpeg');
-  deliver(file,dataUrl);
+  const name='detect_'+stamp()+'.jpg';
+  canvas.toBlob(b=>{if(b)deliver(new File([b],name,{type:'image/jpeg'}));},'image/jpeg',0.9);
 });
 
 let recorder=null,recChunks=[],recStream=null,recStart=0,recTick=null,pendingFile=null,stopping=false;
@@ -766,8 +777,8 @@ function startRec(){
   if(mime===null||!canvas.captureStream){toast('Этот браузер не умеет записывать видео');return;}
   hideSave();
   try{
-    recStream=canvas.captureStream(30);
-    const opts={videoBitsPerSecond:4000000};
+    recStream=canvas.captureStream(24);
+    const opts={videoBitsPerSecond:3000000};
     if(mime)opts.mimeType=mime;
     recorder=new MediaRecorder(recStream,opts);
   }catch(e){
