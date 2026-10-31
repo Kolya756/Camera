@@ -72,7 +72,7 @@ const RU={person:'ЧЕЛОВЕК',bird:'ПТИЦА',cat:'КОШКА',dog:'СОБ
 const KEEP_SCORE=0.15;
 const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·',fake:'TEST'};
 const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[],fake:[]};
-const WANT=COCO.map(c=>CLASSES.includes(c)?c:'');
+const WANT=COCO.map(c=>CLASSES.includes(c)?c:(c==='teddy bear'?'dog':''));
 const IOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 
 const $=id=>document.getElementById(id);
@@ -339,7 +339,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshSmall:0.3,smallH:0.1,confirmSmall:2,show:0.3,sure:0.7,matchIou:0.25,lowIou:0.35,ttl:800,ttlEst:1500,ttlStatic:2500,confirm:2,establish:3,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -502,8 +502,9 @@ function createTracker(o){
     return out;
   }
 
+  const PET={dog:1.5,cat:1.5};
   function vote(t,d){
-    t.votes[d.cls]=(t.votes[d.cls]||0)*0.8+d.score;
+    t.votes[d.cls]=(t.votes[d.cls]||0)*0.8+d.score*(PET[d.cls]||1);
     let best=t.cls,bv=-1;
     for(const k in t.votes)if(t.votes[k]>bv){bv=t.votes[k];best=k;}
     t.cls=best;
@@ -513,7 +514,8 @@ function createTracker(o){
     const nb=d.now||(d.now=replay(d.box,ts));
     const w=weak?0.45:0.7;
     for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*(1-w)+nb[k]*w;
-    t.tDet=ts;t.hits++;t.miss=0;t.lastSeen=now;t.part=0;
+    t.tDet=ts;if(!weak)t.hits++;t.miss=0;t.lastSeen=now;t.part=0;
+    t.weakRun=weak?(t.weakRun||0)+1:0;
     t.score=weak?Math.max(t.score*0.92,d.score):t.score*0.6+d.score*0.4;
     t.peak=Math.max(t.peak,d.score);
     vote(t,d);
@@ -521,7 +523,7 @@ function createTracker(o){
 
   function assign(tr,at,dets,usedT,usedD,minIou,ts,now,weak){
     const pairs=[];
-    tr.forEach((t,i)=>{if(usedT.has(i))return;dets.forEach((d,j)=>{if(usedD.has(j)||d.grp!==t.grp)return;const v=iou(at[i],d.box);if(v>=minIou)pairs.push([v,i,j]);});});
+    tr.forEach((t,i)=>{if(usedT.has(i)||(weak&&(t.weakRun||0)>=P.lowMax&&moving(t,now)>3))return;dets.forEach((d,j)=>{if(usedD.has(j)||d.grp!==t.grp)return;const v=iou(at[i],d.box);if(v>=minIou)pairs.push([v,i,j]);});});
     pairs.sort((a,b)=>b[0]-a[0]);
     for(const [,i,j] of pairs){
       if(usedT.has(i)||usedD.has(j))continue;
@@ -564,16 +566,20 @@ function createTracker(o){
       else{t.tDet=ts;t.miss=0;t.lastSeen=now;t.hits++;t.score=Math.max(t.score*0.9,d.score);vote(t,d);}
     });
     tr.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.93;}});
+    const persons=hi.filter(d=>d.grp==='person'&&d.score>=0.5);
+    for(let i=tr.length-1;i>=0;i--){const t=tr[i];if(t.grp==='person'||(usedT.has(i)&&!(t.weakRun>0)))continue;if(persons.some(d=>inside(t.pos,d.now||d.box)>=0.6))tr.splice(i,1);}
     const fh=T.h*T.scale||1;
     hi.forEach((d,j)=>{
       if(usedH.has(j))return;
       const small=d.box[3]<P.smallH*fh;
-      if(d.score<(small?P.freshSmall:P.fresh))return;
+      const animal=d.grp!=='person';
+      if(d.score<(small?P.freshSmall:(animal?P.freshAnimal:P.fresh)))return;
       for(const t of tr){
         if(t.grp===d.grp&&inside(d.now,t.pos)>=P.partIn)return;
         if(t.grp!==d.grp&&t.hits>=P.establish&&inside(d.now,t.pos)>=P.crossIn&&d.score<P.crossScore)return;
+        if(animal&&t.grp==='person'&&iou(d.now,t.pos)>=0.5&&t.score>d.score)return;
       }
-      tr.push({id:T.nextId++,cls:d.cls,grp:d.grp,votes:{[d.cls]:d.score},pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,peak:d.score,hits:1,miss:0,part:0,small,lastSeen:now});
+      tr.push({id:T.nextId++,cls:d.cls,grp:d.grp,votes:{[d.cls]:d.score*(PET[d.cls]||1)},pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,peak:d.score,hits:1,miss:0,part:0,small,animal,lastSeen:now});
     });
     for(let i=0;i<tr.length;i++)for(let j=tr.length-1;j>i;j--){
       const a=tr[i],b=tr[j];
@@ -586,7 +592,8 @@ function createTracker(o){
       const fw=T.w*T.scale,fh=T.h*T.scale;
       const vis=fw&&fh?inside(t.pos,[0,0,fw,fh]):1;
       const est=t.hits>=P.establish&&t.peak>=P.sure*0.8;
-      const ttl=est?(moving(t,now)<2?P.ttlStatic:P.ttlEst):P.ttl;
+      const mv=moving(t,now);
+      const ttl=est?(mv<2?P.ttlStatic:(t.grp!=='person'?P.ttlAnimalMoving:P.ttlEst)):P.ttl;
       return now-t.lastSeen<=(vis<0.5?ttl*0.3:ttl);
     });
   }
@@ -618,7 +625,7 @@ function createTracker(o){
   }
   function visible(t){
     if(t.hits>=P.establish&&t.peak>=P.sure*0.8)return t.score>=P.low;
-    const need=t.small?P.confirmSmall:P.confirm;
+    const need=t.small?P.confirmSmall:(t.animal?P.confirmAnimal:P.confirm);
     return t.score>=(t.small?P.freshSmall-0.05:P.show)&&(t.hits>=need||t.score>=P.sure);
   }
   function reset(){T.tracks=[];T.frames=[];T.lastTs=0;}
@@ -631,7 +638,7 @@ async function detectLoop(det){
   let cycle=0;
   const idx=detectors.indexOf(det);
   while(running&&detectors.includes(det)){
-    if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)){await sleep(50);continue;}
+    if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)||(recorder&&idx>0)){await sleep(50);continue;}
     cycle++;
     const vis=tracker.tracks.filter(visible);
     const hasSmall=vis.some(t=>t.box[3]<0.15*clean.height),hasLarge=vis.some(t=>t.box[3]>=0.3*clean.height);
@@ -729,7 +736,7 @@ function render(){
     drawBox(x,y,w,h,t);
   }
   if(DIAG&&now-diagT>500){diagT=now;diagEl.textContent=diagText(now);}
-  if(recorder&&now-recFrameT>=41){recFrameT=now;rctx.drawImage(canvas,0,0,rc.width,rc.height);if(recTrack)recTrack.requestFrame();}
+  if(recorder&&now-recFrameT>=50){recFrameT=now;rctx.drawImage(canvas,0,0,rc.width,rc.height);if(recTrack)recTrack.requestFrame();}
   fpsN++;
   if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;}
   cnt.textContent=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
@@ -785,7 +792,7 @@ function startRec(){
   if(mime===null||!canvas.captureStream){toast('Этот браузер не умеет записывать видео');return;}
   hideSave();
   try{
-    const rs=Math.min(1,960/Math.max(canvas.width,canvas.height));
+    const rs=Math.min(1,720/Math.max(canvas.width,canvas.height));
     rc.width=Math.round(canvas.width*rs);rc.height=Math.round(canvas.height*rs);
     rctx.drawImage(canvas,0,0,rc.width,rc.height);
     recTrack=null;
