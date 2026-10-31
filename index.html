@@ -339,7 +339,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -567,7 +567,7 @@ function createTracker(o){
     });
     tr.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.93;}});
     const persons=hi.filter(d=>d.grp==='person'&&d.score>=0.5);
-    for(let i=tr.length-1;i>=0;i--){const t=tr[i];if(t.grp==='person'||(usedT.has(i)&&!(t.weakRun>0)))continue;if(persons.some(d=>inside(t.pos,d.now||d.box)>=0.6))tr.splice(i,1);}
+    for(let i=tr.length-1;i>=0;i--){const t=tr[i];if(t.grp==='person'||(t.miss<2&&(t.weakRun||0)<2))continue;if(persons.some(d=>inside(t.pos,d.now||d.box)>=0.6))tr.splice(i,1);}
     const fh=T.h*T.scale||1;
     hi.forEach((d,j)=>{
       if(usedH.has(j))return;
