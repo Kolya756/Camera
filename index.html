@@ -86,7 +86,7 @@ const cctx=clean.getContext('2d',{willReadFrequently:true});
 
 let stream=null,facing='environment',mode='person',running=false;
 let detectors=[],kind='';
-const POOL=Math.max(1,Math.min(3,parseInt(new URLSearchParams(location.search).get('workers'))||((IOS||(navigator.hardwareConcurrency||2)>=4)?2:1)));
+const POOL=Math.max(1,Math.min(3,parseInt(new URLSearchParams(location.search).get('workers'))||((IOS||((navigator.hardwareConcurrency||2)>=4&&(navigator.deviceMemory||8)>=4))?2:1)));
 let lastTs=0,inferMs=0,cleanTs=0;
 let fps=0,fpsN=0,fpsT=0,lastFrame=0;
 let toastTimer=null;
@@ -211,30 +211,30 @@ async function createDetector(){
     try{const d=await KINDS[saved.kind](SIZE);kind=saved.kind;return d;}catch(e){}
   }
   SIZE=forcedSize||SIZES[0];
-  const tries=navigator.gpu?['wgpu','wcpu']:['wcpu'];
-  const res=await Promise.allSettled(tries.map(k=>KINDS[k](SIZE)));
-  const cands=[];
-  res.forEach((r,i)=>{if(r.status==='fulfilled')cands.push({kind:tries[i],d:r.value,ms:Infinity});});
-  if(!cands.length){const d=await KINDS.main(SIZE);kind='main';return d;}
+  const tries=(navigator.gpu&&params.has('gpu'))?['wgpu','wcpu']:['wcpu'];
   toast('Подбираю режим работы…',0);
   let best=null;
-  for(const c of cands){
-    try{c.ms=await measure(c.d);}catch(e){c.ms=Infinity;}
-    if(!best||c.ms<best.ms)best=c;
+  for(const k of tries){
+    let d=null,ms=Infinity;
+    try{d=await KINDS[k](SIZE);ms=await measure(d);}catch(e){if(d)d.close();d=null;}
+    if(!d)continue;
+    if(!best||ms<best.ms){if(best)best.d.close();best={kind:k,d,ms};}
+    else d.close();
   }
-  for(const c of cands)if(c!==best)c.d.close();
-  if(best.ms===Infinity){best.d.close();const d=await KINDS.main(SIZE);kind='main';return d;}
+  if(!best){const d=await KINDS.main(SIZE);kind='main';return d;}
   kind=best.kind;
   if(!forcedSize&&best.ms>SLOW_MS&&SIZE!==SIZES[SIZES.length-1]){
-    const big=SIZE;
+    const big=SIZE,bigMs=best.ms;
+    best.d.close();best=null;
     try{
       SIZE=SIZES[SIZES.length-1];
       const d2=await KINDS[kind](SIZE);
       let ms2=Infinity;
       try{ms2=await measure(d2);}catch(e){}
-      if(ms2<best.ms*0.85){best.d.close();best={kind,d:d2,ms:ms2};}
-      else{d2.close();SIZE=big;}
-    }catch(e){SIZE=big;}
+      if(ms2<bigMs*0.85)best={kind,d:d2,ms:ms2};
+      else d2.close();
+    }catch(e){}
+    if(!best){SIZE=big;best={kind,d:await KINDS[kind](SIZE),ms:bigMs};}
   }
   try{localStorage.setItem('backend',JSON.stringify({kind,size:SIZE,ver:MVER}));}catch(e){}
   return best.d;
