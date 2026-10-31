@@ -74,6 +74,12 @@ const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·',fake:'TEST'};
 const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[],fake:[]};
 const WANT=COCO.map(c=>CLASSES.includes(c)?c:(c==='teddy bear'?'dog':''));
 const IOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
+const ANDROID_CHROME=/Android/.test(navigator.userAgent)&&/Chrome\/\d/.test(navigator.userAgent)&&!/EdgA|SamsungBrowser|MiuiBrowser|OPR|YaBrowser|UCBrowser/.test(navigator.userAgent);
+const PET_LABEL=new Set(['dog','cat','bird']);
+function labelOf(t){return (t.cls!=='person'&&!PET_LABEL.has(t.cls)&&t.peak<0.6)?'ЖИВОТНОЕ':(RU[t.cls]||t.cls.toUpperCase());}
+let gpuTrial=false,gpuPending=false;
+try{gpuTrial=localStorage.getItem('gpu-trial')!==null;}catch(e){}
+function markGpu(on){gpuPending=on;try{if(on)localStorage.setItem('gpu-trial','1');else localStorage.removeItem('gpu-trial');}catch(e){}}
 
 const $=id=>document.getElementById(id);
 const video=$('v'),canvas=$('c'),ctx=canvas.getContext('2d');
@@ -92,7 +98,8 @@ let stream=null,facing='environment',mode='person',running=false;
 let detectors=[],kind='';
 const POOL=Math.max(1,Math.min(3,parseInt(new URLSearchParams(location.search).get('workers'))||((IOS||((navigator.hardwareConcurrency||2)>=4&&(navigator.deviceMemory||8)>=4))?2:1)));
 let lastTs=0,inferMs=0,cleanTs=0,ageMs=0,detN=0,detRate=0,detT=0;
-let fps=0,fpsN=0,fpsT=0,lastFrame=0,lastStep=0;
+let fps=0,fpsN=0,fpsT=0,lastFrame=0,lastStep=0,newFrame=true,lastVF=0,vfc=false,cntText='',perfText='';
+function armVF(){if(vfc||typeof video.requestVideoFrameCallback!=='function')return;vfc=true;video.requestVideoFrameCallback(()=>{vfc=false;newFrame=true;armVF();});}
 let toastTimer=null,diagT=0;
 const DIAG=new URLSearchParams(location.search).has('diag');
 let glInfo='';
@@ -197,7 +204,7 @@ async function mainDetector(mk){
   };
 }
 
-const KINDS={wgpu:s=>workerDetector(['webgpu','wasm'],s),wcpu:s=>workerDetector(['wasm'],s),main:s=>mainDetector(s)};
+const KINDS={wgpu:s=>workerDetector(['webgpu'],s),wcpu:s=>workerDetector(['wasm'],s),main:s=>mainDetector(s)};
 
 function withTimeout(p,ms){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('время ожидания вышло')),ms))]);}
 
@@ -224,12 +231,14 @@ async function createDetector(){
   if(force&&KINDS[force]){kind=force;setModel(forcedModel||'n512');return KINDS[force](MKEY);}
   let saved=null;
   try{saved=JSON.parse(localStorage.getItem('backend')||'null');}catch(e){}
-  if(!forcedModel&&saved&&saved.ver===MVER&&KINDS[saved.kind]&&MODELS[saved.model]){
+  if(!forcedModel&&saved&&saved.ver===MVER&&KINDS[saved.kind]&&MODELS[saved.model]&&!(saved.kind==='wgpu'&&gpuTrial)){
     setModel(saved.model);
+    if(saved.kind==='wgpu')markGpu(true);
     try{const d=await KINDS[saved.kind](MKEY);kind=saved.kind;return d;}catch(e){}
   }
   setModel(forcedModel||'n512');
-  const tries=(navigator.gpu&&params.has('gpu'))?['wgpu','wcpu']:['wcpu'];
+  const tries=(navigator.gpu&&(params.has('gpu')||(ANDROID_CHROME&&!gpuTrial)))?['wgpu','wcpu']:['wcpu'];
+  if(tries[0]==='wgpu')markGpu(true);
   toast('Подбираю режим работы…',0);
   let best=null;
   for(const k of tries){
@@ -266,7 +275,7 @@ async function fallbackDetector(){
 }
 
 function addWorkers(){
-  if(kind==='main'||kind==='fake')return;
+  if(kind==='main'||kind==='fake'||kind==='wgpu')return;
   for(let i=detectors.length;i<POOL;i++){
     KINDS[kind](MKEY).then(d=>{if(running&&detectors.length&&detectors.length<POOL){detectors.push(d);detectLoop(d);}else d.close();}).catch(()=>{});
   }
@@ -298,6 +307,7 @@ async function openCamera(){
   s.getVideoTracks().forEach(t=>t.addEventListener('ended',()=>{if(running&&stream===s)openCamera().catch(e=>toast('Ошибка камеры: '+errText(e)));}));
   video.srcObject=stream;
   await video.play();
+  newFrame=true;armVF();
   if(!video.videoWidth){await Promise.race([new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true})),sleep(4000)]);}
   tracker.reset();
   try{localStorage.setItem('facing',facing);}catch(e){}
@@ -305,7 +315,7 @@ async function openCamera(){
 
 let sweep=0;
 function focusRoi(vw,vh){
-  const small=tracker.tracks.filter(t=>visible(t)&&t.box[3]<0.15*vh);
+  const small=tracker.tracks.filter(t=>t.box[3]<0.15*vh&&(visible(t)||(t.small&&t.hits<2&&modeOk(t))));
   let cx=vw/2,cy=vh/2;
   if(small.length){
     let x1=Infinity,y1=Infinity,x2=-Infinity,y2=-Infinity;
@@ -339,7 +349,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,sureIn:0.6,ttlSmall:2000,hardMiss:3,handR:4,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -350,6 +360,11 @@ function createTracker(o){
   }
   function iou(a,b){const i=interArea(a,b);const u=a[2]*a[3]+b[2]*b[3]-i;return u>0?i/u:0;}
   function inside(a,b){const aa=a[2]*a[3];return aa>0?interArea(a,b)/aa:0;}
+  function covered(t,b,roi){
+    if(!roi)return !t.small;
+    const m=0.04;
+    return inside(b,[roi[0]+roi[2]*m,roi[1]+roi[3]*m,roi[2]*(1-2*m),roi[3]*(1-2*m)])>=0.95;
+  }
 
   function sad(prev,cur,w,x,y,bw,bh,dx,dy,st){
     let s=0;
@@ -507,6 +522,7 @@ function createTracker(o){
     t.votes[d.cls]=(t.votes[d.cls]||0)*0.8+d.score*(PET[d.cls]||1);
     let best=t.cls,bv=-1;
     for(const k in t.votes)if(t.votes[k]>bv){bv=t.votes[k];best=k;}
+    if(t.grp!=='person'&&!PET[best]){const pd=t.votes.dog||0,pc=t.votes.cat||0;if(Math.max(pd,pc)>=0.6*bv)best=pd>=pc?'dog':'cat';}
     t.cls=best;
   }
 
@@ -514,7 +530,7 @@ function createTracker(o){
     const nb=d.now||(d.now=replay(d.box,ts));
     const w=weak?0.45:0.7;
     for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*(1-w)+nb[k]*w;
-    t.tDet=ts;if(!weak)t.hits++;t.miss=0;t.lastSeen=now;t.part=0;
+    t.tDet=ts;if(!weak)t.hits++;t.miss=0;t.hard=0;t.lastSeen=now;t.part=0;
     t.weakRun=weak?(t.weakRun||0)+1:0;
     t.score=weak?Math.max(t.score*0.92,d.score):t.score*0.6+d.score*0.4;
     t.peak=Math.max(t.peak,d.score);
@@ -531,7 +547,7 @@ function createTracker(o){
     }
   }
 
-  function update(dets,ts,now){
+  function update(dets,ts,now,roi){
     if(ts<T.lastTs-P.stale)return;
     T.lastTs=Math.max(T.lastTs,ts);
     for(const d of dets)d.grp=GROUP(d.cls);
@@ -565,12 +581,15 @@ function createTracker(o){
       if(t.part>=P.partAccept)adopt(t,d,ts,now,false);
       else{t.tDet=ts;t.miss=0;t.lastSeen=now;t.hits++;t.score=Math.max(t.score*0.9,d.score);vote(t,d);}
     });
-    tr.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.93;}});
+    tr.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.93;if(covered(t,at[i],roi))t.hard=(t.hard||0)+1;}});
     const persons=hi.filter(d=>d.grp==='person'&&d.score>=0.5);
     for(let i=tr.length-1;i>=0;i--){const t=tr[i];if(t.grp==='person'||(t.miss<2&&(t.weakRun||0)<2))continue;if(persons.some(d=>inside(t.pos,d.now||d.box)>=0.6))tr.splice(i,1);}
-    const fh=T.h*T.scale||1;
-    hi.forEach((d,j)=>{
-      if(usedH.has(j))return;
+    const fw=T.w*T.scale,fh=T.h*T.scale||1;
+    const cands=[];
+    hi.forEach((d,j)=>{if(!usedH.has(j))cands.push(d);});
+    lo.forEach((d,j)=>{if(!usedL.has(j)&&d.box[3]<P.smallH*fh&&d.score>=P.freshSmall)cands.push(d);});
+    cands.forEach(d=>{
+      d.now=d.now||replay(d.box,ts);
       const small=d.box[3]<P.smallH*fh;
       const animal=d.grp!=='person';
       if(d.score<(small?P.freshSmall:(animal?P.freshAnimal:P.fresh)))return;
@@ -579,7 +598,19 @@ function createTracker(o){
         if(t.grp!==d.grp&&t.hits>=P.establish&&inside(d.now,t.pos)>=P.crossIn&&d.score<P.crossScore)return;
         if(animal&&t.grp==='person'&&iou(d.now,t.pos)>=0.5&&t.score>d.score)return;
       }
-      tr.push({id:T.nextId++,cls:d.cls,grp:d.grp,votes:{[d.cls]:d.score*(PET[d.cls]||1)},pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,peak:d.score,hits:1,miss:0,part:0,small,animal,lastSeen:now});
+      const m=fw*0.02;
+      const edge=fw>0&&(d.now[0]<=m||d.now[1]<=m||d.now[0]+d.now[2]>=fw-m||d.now[1]+d.now[3]>=fh-m);
+      const nt={id:T.nextId++,cls:d.cls,grp:d.grp,votes:{[d.cls]:d.score*(PET[d.cls]||1)},pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,peak:d.score,hits:1,miss:0,hard:0,part:0,small,animal,edge,lastSeen:now};
+      let old=null,od=Infinity;
+      for(const t of tr){
+        if(t.grp!==d.grp||t.miss<2||t.pos[3]>=0.3*fh)continue;
+        const ratio=d.now[3]/Math.max(1,t.pos[3]);
+        if(ratio<0.5||ratio>2)continue;
+        const dist=Math.hypot(d.now[0]+d.now[2]/2-t.pos[0]-t.pos[2]/2,d.now[1]+d.now[3]/2-t.pos[1]-t.pos[3]/2);
+        if(dist<=P.handR*Math.max(t.pos[2],t.pos[3])&&dist<od){od=dist;old=t;}
+      }
+      if(old){nt.id=old.id;nt.hits=Math.max(nt.hits,Math.min(old.hits,P.establish));nt.peak=Math.max(nt.peak,old.peak);tr.splice(tr.indexOf(old),1);}
+      tr.push(nt);
     });
     for(let i=0;i<tr.length;i++)for(let j=tr.length-1;j>i;j--){
       const a=tr[i],b=tr[j];
@@ -593,7 +624,8 @@ function createTracker(o){
       const vis=fw&&fh?inside(t.pos,[0,0,fw,fh]):1;
       const est=t.hits>=P.establish&&t.peak>=P.sure*0.8;
       const mv=moving(t,now);
-      const ttl=est?(mv<2?P.ttlStatic:(t.grp!=='person'?P.ttlAnimalMoving:P.ttlEst)):P.ttl;
+      const ttl=est?(mv<2?P.ttlStatic:(t.grp!=='person'?P.ttlAnimalMoving:P.ttlEst)):(t.small?P.ttlSmall:P.ttl);
+      if((t.hard||0)>=P.hardMiss)return false;
       return now-t.lastSeen<=(vis<0.5?ttl*0.3:ttl);
     });
   }
@@ -626,7 +658,7 @@ function createTracker(o){
   function visible(t){
     if(t.hits>=P.establish&&t.peak>=P.sure*0.8)return t.score>=P.low;
     const need=t.small?P.confirmSmall:(t.animal?P.confirmAnimal:P.confirm);
-    return t.score>=(t.small?P.freshSmall-0.05:P.show)&&(t.hits>=need||t.score>=P.sure);
+    return t.score>=(t.small?P.freshSmall-0.05:P.show)&&(t.hits>=need||t.peak>=P.sure||(t.peak>=P.sureIn&&!t.edge));
   }
   function reset(){T.tracks=[];T.frames=[];T.lastTs=0;}
   return {P,T,motionStep,update,smooth,visible,reset,match,step,get tracks(){return T.tracks;}};
@@ -641,8 +673,8 @@ async function detectLoop(det){
     if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)||(recorder&&idx>0)){await sleep(50);continue;}
     cycle++;
     const vis=tracker.tracks.filter(visible);
-    const hasSmall=vis.some(t=>t.box[3]<0.15*clean.height),hasLarge=vis.some(t=>t.box[3]>=0.3*clean.height);
-    const focus=FOCUS&&!recorder&&(hasSmall?(detectors.length>1?(idx>0&&cycle%2===0):(cycle%3===0)):(hasLarge?(cycle%4===0):(detectors.length>1?(idx>0&&cycle%2===0):(cycle%2===0))));
+    const hasSmall=tracker.tracks.some(t=>t.box[3]<0.15*clean.height&&(visible(t)||(t.small&&t.hits<2&&modeOk(t)))),hasLarge=vis.some(t=>t.box[3]>=0.3*clean.height);
+    const focus=FOCUS&&(recorder?(idx===0&&!hasLarge&&cycle%2===0):(hasSmall?(detectors.length>1?(idx>0&&cycle%2===0):(cycle%3===0)):(hasLarge?(cycle%4===0):(detectors.length>1?(idx>0&&cycle%2===0):(cycle%2===0)))));
     const g=grabFrame(focus);
     const ts=cleanTs;
     try{
@@ -651,7 +683,8 @@ async function detectLoop(det){
       inferMs=inferMs?inferMs*0.8+r.ms*0.2:r.ms;
       ageMs=ageMs?ageMs*0.8+(now-ts)*0.2:(now-ts);
       detN++;
-      tracker.update(r.dets.map(d=>unbox(d,g)).filter(d=>d&&d.box[2]>1&&d.box[3]>1),ts,now);
+      if(gpuPending)markGpu(false);
+      tracker.update(r.dets.map(d=>unbox(d,g)).filter(d=>d&&d.box[2]>1&&d.box[3]>1),ts,now,g.focus?[g.ox,g.oy,g.vw,g.vh]:null);
     }catch(e){
       const i=detectors.indexOf(det);
       if(i>=0)detectors.splice(i,1);
@@ -665,15 +698,10 @@ async function detectLoop(det){
   }
 }
 
-function visible(t){
-  if(!tracker.visible(t))return false;
-  if(mode==='person')return t.cls==='person';
-  if(mode==='animal')return t.cls!=='person';
-  return true;
-}
+function modeOk(t){return mode==='all'||(mode==='person')===(t.cls==='person');}
+function visible(t){return tracker.visible(t)&&modeOk(t);}
 
-function drawBox(x,y,w,h,t){
-  const s=Math.max(1,canvas.width/640);
+function drawBox(ctx,x,y,w,h,t,s){
   const color=t.miss>1?'#ffcc33':(t.cls==='person'?'#39ff7a':'#3ad7ff');
   ctx.strokeStyle=color;
   ctx.globalAlpha=0.55;
@@ -689,7 +717,7 @@ function drawBox(x,y,w,h,t){
   ctx.moveTo(x+w,y+h-L);ctx.lineTo(x+w,y+h);ctx.lineTo(x+w-L,y+h);
   ctx.moveTo(x+L,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+h-L);
   ctx.stroke();
-  const label=(RU[t.cls]||t.cls.toUpperCase())+' #'+t.id+'  '+Math.round(t.score*100)+'%';
+  const label=labelOf(t)+' #'+t.id+'  '+Math.round(t.score*100)+'%';
   ctx.font='600 '+(14*s)+'px ui-monospace,Menlo,Consolas,monospace';
   const tw=ctx.measureText(label).width+12*s;
   const th=22*s;
@@ -710,14 +738,19 @@ function render(){
   const now=performance.now();
   const dt=Math.min(100,now-lastFrame);lastFrame=now;
   const mirror=facing==='user';
-  if(clean.width!==vw||clean.height!==vh){clean.width=vw;clean.height=vh;}
-  cctx.drawImage(video,0,0,vw,vh);
-  cleanTs=now;
+  const fresh=newFrame||now-lastVF>500;
+  if(fresh){
+    newFrame=false;lastVF=now;
+    if(clean.width!==vw||clean.height!==vh){clean.width=vw;clean.height=vh;}
+    cctx.drawImage(video,0,0,vw,vh);
+    cleanTs=now;
+    armVF();
+  }
   ctx.save();
   if(mirror){ctx.translate(vw,0);ctx.scale(-1,1);}
-  ctx.drawImage(clean,0,0,vw,vh);
+  ctx.drawImage(video,0,0,vw,vh);
   ctx.restore();
-  if(now-lastStep>=tracker.P.minStep){
+  if(fresh&&now-lastStep>=tracker.P.minStep){
     const sw=Math.max(16,Math.round(vw/8)),sh=Math.max(9,Math.round(vh/8));
     if(gc.width!==sw||gc.height!==sh){gc.width=sw;gc.height=sh;gctx.imageSmoothingEnabled=true;gctx.imageSmoothingQuality='high';}
     gctx.drawImage(clean,0,0,sw,sh);
@@ -728,20 +761,50 @@ function render(){
   }
   tracker.smooth(now,dt);
   let nP=0,nA=0;
+  const S=Math.max(1,vw/640);
   for(const t of tracker.tracks){
     if(!visible(t))continue;
     if(t.cls==='person')nP++;else nA++;
     let [x,y,w,h]=t.box;
     if(mirror)x=vw-x-w;
-    drawBox(x,y,w,h,t);
+    drawBox(ctx,x,y,w,h,t,S);
   }
   if(DIAG&&now-diagT>500){diagT=now;diagEl.textContent=diagText(now);}
-  if(recorder&&now-recFrameT>=50){recFrameT=now;rctx.drawImage(canvas,0,0,rc.width,rc.height);if(recTrack)recTrack.requestFrame();}
+  if(recorder&&now-recFrameT>=recInt){recFrameT=now;feedRec(vw,vh,mirror,S);}
   fpsN++;
-  if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;}
-  cnt.textContent=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
-  perf.textContent=Math.round(fps)+' FPS'+(detectors.length?' · '+Math.round(inferMs)+'мс · '+LABEL[kind]+(detectors.length>1?'×'+detectors.length:'')+'·'+MODELS[MKEY].name+SIZE:' · загрузка…');
+  if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;if(recorder)adaptRec();}
+  const ct=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
+  if(ct!==cntText){cntText=ct;cnt.textContent=ct;}
+  const pt=Math.round(fps)+' FPS'+(detectors.length?' · '+Math.round(inferMs)+'мс · '+LABEL[kind]+(detectors.length>1?'×'+detectors.length:'')+'·'+MODELS[MKEY].name+SIZE:' · загрузка…');
+  if(pt!==perfText){perfText=pt;perf.textContent=pt;}
 }
+function feedRec(vw,vh,mirror,S){
+  const rs=rc.width/vw;
+  rctx.save();
+  if(mirror){rctx.translate(rc.width,0);rctx.scale(-1,1);}
+  rctx.drawImage(clean,0,0,vw,vh,0,0,rc.width,rc.height);
+  rctx.restore();
+  for(const t of tracker.tracks){
+    if(!visible(t))continue;
+    let [x,y,w,h]=t.box;
+    if(mirror)x=vw-x-w;
+    drawBox(rctx,x*rs,y*rs,w*rs,h*rs,t,S*rs);
+  }
+  if(recTrack)recTrack.requestFrame();
+}
+function adaptRec(){
+  const base=REC[recLevel].int;
+  if(fps<24){
+    recSlow++;recFast=0;
+    if(recInt<100)recInt=Math.min(100,recInt+17);
+    else if(recSlow>=3&&recLevel<REC.length-1){recLevel++;saveRecLevel();recSlow=0;}
+  }else{
+    recSlow=0;
+    if(fps>=45){recFast++;if(recInt>base)recInt=Math.max(base,recInt-17);else if(recFast>=5&&recLevel>0){recLevel--;saveRecLevel();recFast=0;}}
+    else recFast=0;
+  }
+}
+function saveRecLevel(){try{localStorage.setItem('recLevel',String(recLevel));}catch(e){}}
 
 function setMode(m){
   mode=m;
@@ -770,17 +833,44 @@ async function deliver(file,url){
 }
 
 
+const PHOTO_SRC=`self.onmessage=async e=>{const m=e.data,b=m.bmp;let blob=null;try{const c=new OffscreenCanvas(b.width,b.height),x=c.getContext('2d');x.drawImage(b,0,0);const r=await c.convertToBlob({type:'image/jpeg',quality:0.9});if(r&&r.type==='image/jpeg')blob=r;}catch(err){}try{b.close();}catch(err){}self.postMessage({id:m.id,blob});};`;
+const OFFSHOT=typeof OffscreenCanvas!=='undefined'&&typeof OffscreenCanvas.prototype.convertToBlob==='function'&&typeof createImageBitmap==='function'&&typeof Worker!=='undefined';
+let photoW=null,photoId=0;
+const photoJobs=new Map();
+function photoWorker(){
+  if(photoW)return photoW;
+  const w=new Worker(URL.createObjectURL(new Blob([PHOTO_SRC],{type:'text/javascript'})));
+  w.onmessage=e=>{const j=photoJobs.get(e.data.id);if(j){photoJobs.delete(e.data.id);j(e.data.blob);}};
+  w.onerror=()=>{if(photoW===w){photoW=null;w.terminate();}const js=[...photoJobs.values()];photoJobs.clear();for(const j of js)j(null);};
+  photoW=w;
+  return w;
+}
+function shotBlob(){return new Promise(r=>canvas.toBlob(r,'image/jpeg',0.9));}
+async function encodeShot(){
+  if(!OFFSHOT)return shotBlob();
+  let bmp=null;
+  try{bmp=await createImageBitmap(canvas);}catch(e){return shotBlob();}
+  const blob=await new Promise(res=>{
+    const id=++photoId;
+    photoJobs.set(id,res);
+    try{photoWorker().postMessage({id,bmp},[bmp]);}catch(e){photoJobs.delete(id);res(null);}
+  });
+  return blob||shotBlob();
+}
 shot.addEventListener('click',()=>{
   if(!running||!canvas.width)return;
   flash.style.opacity='0.85';
   setTimeout(()=>{flash.style.opacity='0';},70);
   const name='detect_'+stamp()+'.jpg';
-  canvas.toBlob(b=>{if(b)deliver(new File([b],name,{type:'image/jpeg'}));},'image/jpeg',0.9);
+  encodeShot().then(b=>{if(b)deliver(new File([b],name,{type:'image/jpeg'}));});
 });
 
 let recorder=null,recChunks=[],recStream=null,recStart=0,recTick=null,pendingFile=null,stopping=false,recTrack=null,recFrameT=0;
+const REC=[{px:720,int:50,bps:3000000},{px:540,int:67,bps:2000000},{px:404,int:83,bps:1200000}];
+let recInt=50,recLevel=0,recSlow=0,recFast=0;
+try{recLevel=Math.min(REC.length-1,Math.max(0,parseInt(localStorage.getItem('recLevel'))||0));}catch(e){}
 const rc=document.createElement('canvas');
-const rctx=rc.getContext('2d');
+const rctx=rc.getContext('2d',{willReadFrequently:true});
 function pickMime(){
   if(typeof MediaRecorder==='undefined')return null;
   for(const t of ['video/mp4;codecs=avc1.42E01E','video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'])if(MediaRecorder.isTypeSupported(t))return t;
@@ -789,17 +879,19 @@ function pickMime(){
 function hideSave(){save.hidden=true;pendingFile=null;}
 function startRec(){
   const mime=pickMime();
-  if(mime===null||!canvas.captureStream){toast('Этот браузер не умеет записывать видео');return;}
+  if(mime===null||!rc.captureStream){toast('Этот браузер не умеет записывать видео');return;}
   hideSave();
   try{
-    const rs=Math.min(1,720/Math.max(canvas.width,canvas.height));
-    rc.width=Math.round(canvas.width*rs);rc.height=Math.round(canvas.height*rs);
+    const L=REC[recLevel];
+    const rs=Math.min(1,L.px/Math.max(canvas.width,canvas.height));
+    rc.width=Math.round(canvas.width*rs/2)*2;rc.height=Math.round(canvas.height*rs/2)*2;
+    recInt=L.int;recSlow=0;recFast=0;
     rctx.drawImage(canvas,0,0,rc.width,rc.height);
     recTrack=null;
     try{recStream=rc.captureStream(0);recTrack=recStream.getVideoTracks()[0];if(!recTrack||typeof recTrack.requestFrame!=='function'){recTrack=null;recStream=rc.captureStream(24);}}
     catch(e){recStream=rc.captureStream(24);}
     recFrameT=0;
-    const opts={videoBitsPerSecond:3000000};
+    const opts={videoBitsPerSecond:REC[recLevel].bps};
     if(mime)opts.mimeType=mime;
     recorder=new MediaRecorder(recStream,opts);
   }catch(e){
