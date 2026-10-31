@@ -88,7 +88,7 @@ if(SW_OK&&!ISO){
 async function dropSw(){
   try{localStorage.setItem('nosw','1');const rs=await navigator.serviceWorker.getRegistrations();for(const r of rs)await r.unregister();}catch(e){}
 }
-const MODELS={n512:{name:'n',size:512,file:'n512p'},n640:{name:'n',size:640,file:'n640p'},nrect:{name:'n',size:512,rect:1,file:'nrect'},s416:{name:'s',size:416,file:'s416p'},s512:{name:'s',size:512,file:'s512p'},srect:{name:'s',size:512,rect:1,file:'srect'},q8n:{name:'q8n',size:512,rect:1,file:'q8nrect'},q8s:{name:'q8s',size:512,rect:1,file:'q8srect'}};
+const MODELS={n512:{name:'n',size:512,file:'n512p'},n640:{name:'n',size:640,file:'n640p'},nrect:{name:'n',size:512,rect:1,file:'nrect'},s416:{name:'s',size:416,file:'s416p'},s512:{name:'s',size:512,file:'s512p'},srect:{name:'s',size:512,rect:1,file:'srect'}};
 let MKEY='nrect',SIZE=512;
 const MVER='v5';
 const RECT=[384,672];
@@ -370,7 +370,7 @@ async function fallbackDetector(){
 }
 
 function fakeDetector(base,jit){
-  return {async detect(g){const ms=jit?base*(1-jit+2*jit*Math.random()):base;await sleep(ms);return {dets:window.__fakeDets(clean,g&&g.iw||SIZE,g&&g.ih||SIZE),ms};},close(){}};
+  return {async detect(g){const ms=jit?base*(1-jit+2*jit*Math.random()):base;await sleep(ms);return {dets:window.__fakeDets(clean,g&&g.iw||SIZE,g&&g.ih||SIZE,g),ms};},close(){}};
 }
 function addWorkers(){
   if(kind==='fake'){if(PARAMS.has('workers'))for(let i=detectors.length;i<POOL;i++){const d=fakeDetector(parseInt(PARAMS.get('fakedet'))||250,0.4);detectors.push(d);detectLoop(d);}return;}
@@ -449,7 +449,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,sureIn:0.6,ttlSmall:2000,hardMiss:3,handR:4,qPoor:1.5,refPoor:0.9,refGood:0.45,coastMs:600,kfQ:1e-8,kfR:1e-3,kfPmax:0.01,trailMs:5000,trailMax:160,lostMs:10000,lostMax:40,reidSim:0.6,reidR:1.5,featMs:1000,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,sureIn:0.6,ttlSmall:2000,hardMiss:3,handR:4,qPoor:1.5,refPoor:0.9,refGood:0.45,coastMs:600,kfQ:1e-8,kfR:1e-3,kfPmax:0.01,trailMs:5000,trailMax:160,lostMs:10000,lostMax:40,reidSim:0.6,reidR:1.5,reidMin:80,featMs:1000,trailMove:3,nearK:1.5,deadReckon:1,detVel:1,nearMatch:1,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0,lost:[],seen:new Set(),reid:0,detInt:0,lat:0};
   function slowK(){return Math.min(4,Math.max(1,T.detInt/320));}
   function histWin(){return Math.max(P.histMs,2*T.detInt+200,1.3*T.lat+300);}
@@ -474,12 +474,23 @@ function createTracker(o){
     if(f){t.feat=t.feat&&!force?f.map((v,i)=>v*0.5+t.feat[i]*0.5):f;t.featT=now;}
   }
   function trail(t,now){
-    const c=[t.pos[0]+t.pos[2]/2,t.pos[1]+t.pos[3]/2,now];
+    const b=t.box||t.pos;
+    const c=[b[0]+b[2]/2,b[1]+b[3]/2,now];
     const tr=t.trail;
-    if(tr.length&&now-tr[tr.length-1][2]<60)return;
+    const last=tr[tr.length-1];
+    if(last&&(now-last[2]<60||Math.hypot(c[0]-last[0],c[1]-last[1])<P.trailMove))return;
     tr.push(c);
     while(tr.length&&(now-tr[0][2]>P.trailMs||tr.length>P.trailMax))tr.shift();
   }
+  function near(a,b){
+    const sa=Math.max(a[2],a[3]),sb=Math.max(b[2],b[3]);
+    const ratio=sb/Math.max(1,sa);
+    if(ratio<0.67||ratio>1.5)return false;
+    const d=Math.hypot(a[0]+a[2]/2-b[0]-b[2]/2,a[1]+a[3]/2-b[1]-b[3]/2);
+    return d<=Math.max(60,P.nearK*Math.max(sa,sb));
+  }
+  function coastWin(){return Math.max(P.coastMs,2*T.detInt);}
+  function gdisp(a,b){let x=0,y=0;for(const f of T.frames)if(f.t>a&&f.t<=b){x+=(f.gdx||0)*T.scale;y+=(f.gdy||0)*T.scale;}return [x,y];}
 
   function interArea(a,b){
     const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]);
@@ -627,7 +638,7 @@ function createTracker(o){
         const lh=t.hist[t.hist.length-1];
         const sd=Math.max(1,now-prev.t);
         kfPredict(t,sd);
-        const coastOk=t.kf.p<P.kfPmax&&now-t.kfT<P.coastMs;
+        const coastOk=t.kf.p<P.kfPmax&&now-t.kfT<coastWin();
         const m=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
         let dx,dy,good=!!m&&m.q<P.qPoor;
         if(good){
@@ -638,7 +649,7 @@ function createTracker(o){
             const m2=step(prev2,cur,b2,g2x,g2y,(lh.dx+dx)/T.scale,(lh.dy+dy)/T.scale);
             if(m2&&m2.q<P.qPoor){dx=m2.dx-lh.dx;dy=m2.dy-lh.dy;}
           }
-        }else if(coastOk){dx=t.kf.vx*sd;dy=t.kf.vy*sd;}
+        }else if(coastOk){dx=cur.gdx*T.scale+t.kf.vx*sd;dy=cur.gdy*T.scale+t.kf.vy*sd;}
         else{dx=cur.gdx*T.scale;dy=cur.gdy*T.scale;}
         t.pos[0]+=dx;t.pos[1]+=dy;
         const pb=[t.pos[0]+t.pos[2]*0.2,t.pos[1]+t.pos[3]*0.1,t.pos[2]*0.6,t.pos[3]*0.8];
@@ -652,12 +663,12 @@ function createTracker(o){
         }
         if(rq>P.refPoor&&(!good||!owned)){
           t.pos[0]-=dx;t.pos[1]-=dy;
-          if(coastOk){dx=t.kf.vx*sd;dy=t.kf.vy*sd;}else{dx=cur.gdx*T.scale;dy=cur.gdy*T.scale;}
+          if(coastOk){dx=cur.gdx*T.scale+t.kf.vx*sd;dy=cur.gdy*T.scale+t.kf.vy*sd;}else{dx=cur.gdx*T.scale;dy=cur.gdy*T.scale;}
           t.pos[0]+=dx;t.pos[1]+=dy;good=false;
         }
-        t.vel=[dx/sd,dy/sd];t.velT=now;t.mq=m?m.q:1;
-        if(good&&owned&&rq<P.refGood){kfUpdate(t,dx/sd,dy/sd,P.kfR*(1+4*m.q));t.kfT=now;}
-        else if(good&&owned)kfUpdate(t,dx/sd,dy/sd,P.kfR*20);
+        t.vel=[dx/sd,dy/sd];t.velT=now;t.mq=m?m.q:1;t.nm=m?0:(t.nm||0)+1;
+        if(good&&owned&&rq<P.refGood){kfUpdate(t,(dx-cur.gdx*T.scale)/sd,(dy-cur.gdy*T.scale)/sd,P.kfR*(1+4*m.q));t.kfT=now;}
+        else if(good&&owned)kfUpdate(t,(dx-cur.gdx*T.scale)/sd,(dy-cur.gdy*T.scale)/sd,P.kfR*20);
         if(owned)refresh(t,now,false);
         trail(t,now);
         t.hist.push({t:now,dx,dy});
@@ -722,8 +733,17 @@ function createTracker(o){
 
   function adopt(t,d,ts,now,weak){
     const nb=d.now||(d.now=replay(d.box,ts));
+    if(P.deadReckon&&(t.nm||0)>=2&&t.kf.p<P.kfPmax&&now-t.kfT<coastWin()){
+      const lag=now-ts;
+      nb[0]+=t.kf.vx*lag;nb[1]+=t.kf.vy*lag;
+    }
     const w=weak?0.45:0.7;
     if(ts>=t.tDet)for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*(1-w)+nb[k]*w;
+    if(P.detVel&&!weak&&ts>t.tDet&&(t.nm||0)>=2){
+      const cx=d.box[0]+d.box[2]/2,cy=d.box[1]+d.box[3]/2;
+      if(t.dprev){const dt=ts-t.dprev.ts;if(dt>50&&dt<3000){const [gx,gy]=gdisp(t.dprev.ts,ts);kfUpdate(t,(cx-t.dprev.cx-gx)/dt,(cy-t.dprev.cy-gy)/dt,Math.max(P.kfR,18/(dt*dt)));t.kfT=now;}}
+      t.dprev={ts,cx,cy};
+    }
     t.tDet=Math.max(t.tDet,ts);if(!weak)t.hits++;t.miss=0;t.hard=0;t.lastSeen=now;t.part=0;
     if(!weak)t.fresh=1;
     t.weakRun=weak?(t.weakRun||0)+1:0;
@@ -759,6 +779,12 @@ function createTracker(o){
       d.now=replay(d.box,ts);
       let bi=-1,bv=0;
       tr.forEach((t,i)=>{if(usedT.has(i)||t.grp!==d.grp)return;const v=iou(t.pos,d.now);if(v>=P.matchIou&&v>bv){bv=v;bi=i;}});
+      if(bi>=0){usedT.add(bi);usedH.add(j);adopt(tr[bi],d,ts,now,false);}
+    });
+    hi.forEach((d,j)=>{
+      if(!P.nearMatch||usedH.has(j)||d.box[3]>=P.smallH*(T.h*T.scale||1)*1.5)return;
+      let bi=-1,bd=Infinity;
+      tr.forEach((t,i)=>{if(usedT.has(i)||t.grp!==d.grp||!near(t.pos,d.now))return;const dd=Math.hypot(t.pos[0]-d.now[0],t.pos[1]-d.now[1]);if(dd<bd){bd=dd;bi=i;}});
       if(bi>=0){usedT.add(bi);usedH.add(j);adopt(tr[bi],d,ts,now,false);}
     });
     assign(tr,at,lo,usedT,usedL,P.lowIou,ts,now,true);
@@ -817,11 +843,11 @@ function createTracker(o){
           const el=now-g.t,sz=Math.max(g.pos[2],g.pos[3]);
           const px=g.pos[0]+g.pos[2]/2+g.vx*Math.min(el,1500),py=g.pos[1]+g.pos[3]/2+g.vy*Math.min(el,1500);
           const dist=Math.hypot(d.now[0]+d.now[2]/2-px,d.now[1]+d.now[3]/2-py);
-          const reach=P.reidR*sz*(1+el/1000);
+          const reach=Math.max(P.reidMin,P.reidR*sz*(1+el/1000));
           const s=sim(nt.feat,g.feat);
           let score=-1;
-          if(s>=0){if(s>=P.reidSim&&(dist<=reach||g.edge))score=s+(dist<=reach?0.2:0);}
-          else if(dist<=reach*0.5&&el<2000)score=0.5;
+          if(s>=0&&sz>=40){if(s>=P.reidSim&&(dist<=reach||g.edge))score=s+(dist<=reach?0.2:0);}
+          else if(dist<=reach*0.6&&el<3000)score=0.5;
           if(score>bs){bs=score;best=g;}
         }
         if(best){nt.id=best.id;nt.hits=P.establish;nt.peak=Math.max(nt.peak,best.peak);nt.votes=best.votes;nt.cls=best.cls;nt.trail=best.trail.filter(c=>now-c[2]<=P.trailMs);nt.born=best.born;nt.reid=(best.reid||0)+1;T.reid++;L.splice(L.indexOf(best),1);}
@@ -934,7 +960,9 @@ function featureOf(box){
   for(let i=0;i<d.length;i+=4)f[(d[i]>>6)*16+(d[i+1]>>6)*4+(d[i+2]>>6)]+=1/256;
   return f;
 }
-const tracker=createTracker(PARAMS.has('nofeat')?{}:{feature:featureOf});
+const TRK={};
+for(const kv of (PARAMS.get('trk')||'').split(',')){const [k,v]=kv.split(':');if(k&&v!==undefined)TRK[k]=parseFloat(v);}
+const tracker=createTracker(Object.assign(PARAMS.has('nofeat')?{}:{feature:featureOf},TRK));
 const panel=$('panel'),panelSum=$('panelSum'),panelList=$('panelList'),editHint=$('editHint');
 function saveFx(){try{localStorage.setItem('fx',JSON.stringify(FX));}catch(e){}}
 function saveGeo(){try{localStorage.setItem('zones',JSON.stringify(zones));localStorage.setItem('lines',JSON.stringify(lines));}catch(e){}}
