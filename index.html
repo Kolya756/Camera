@@ -54,15 +54,17 @@ video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 <button id="go" class="btn">Включить камеру</button>
 </div>
 <script type="module">
-const MP='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0';
-const MODEL='https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/1/efficientdet_lite2.tflite';
+const ORT='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
+const MODEL=new URL('model.onnx',location.href).href;
+const SIZE=416;
+const COCO=['person','bicycle','car','motorcycle','airplane','bus','train','truck','boat','traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack','umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball','kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket','bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple','sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair','couch','potted plant','bed','dining table','toilet','tv','laptop','mouse','remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator','book','clock','vase','scissors','teddy bear','hair drier','toothbrush'];
 const ANIMALS=['bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe'];
 const CLASSES=['person',...ANIMALS];
 const RU={person:'ЧЕЛОВЕК',bird:'ПТИЦА',cat:'КОШКА',dog:'СОБАКА',horse:'ЛОШАДЬ',sheep:'ОВЦА',cow:'КОРОВА',elephant:'СЛОН',bear:'МЕДВЕДЬ',zebra:'ЗЕБРА',giraffe:'ЖИРАФ'};
-const FRAME_MAX=640;
-const KEEP_SCORE=0.3,NEW_SCORE=0.45,SHOW_SCORE=0.35,SURE_SCORE=0.7,MATCH_IOU=0.25,TTL=700,CONFIRM_HITS=2,CONTAIN=0.9;
+const KEEP_SCORE=0.3;
 const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·'};
 const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[]};
+const WANT=COCO.map(c=>CLASSES.includes(c)?c:'');
 const IOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 
 const $=id=>document.getElementById(id);
@@ -73,41 +75,63 @@ const save=$('save'),saveMsg=$('saveMsg'),saveBtn=$('saveBtn'),discardBtn=$('dis
 const toastEl=$('toast'),flash=$('flash'),startScreen=$('start'),msg=$('msg'),go=$('go');
 const fc=document.createElement('canvas');
 const fctx=fc.getContext('2d',{willReadFrequently:true});
+const gc=document.createElement('canvas');
+const gctx=gc.getContext('2d',{willReadFrequently:true});
+const clean=document.createElement('canvas');
+const cctx=clean.getContext('2d',{willReadFrequently:true});
 
 let stream=null,facing='environment',mode='person',running=false;
-let detector=null,kind='';
-let tracks=[],nextId=1,lastTs=0,inferMs=0;
+let detectors=[],kind='';
+const POOL=Math.max(1,Math.min(3,parseInt(new URLSearchParams(location.search).get('workers'))||((IOS||(navigator.hardwareConcurrency||2)>=4)?2:1)));
+let lastTs=0,inferMs=0,cleanTs=0;
 let fps=0,fpsN=0,fpsT=0,lastFrame=0;
 let toastTimer=null;
 
 try{const m=localStorage.getItem('mode');if(m==='person'||m==='animal'||m==='all')mode=m;const f=localStorage.getItem('facing');if(f==='user'||f==='environment')facing=f;}catch(e){}
 
+const YOLO_LIB=`
+function iou(a,b){const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]),x2=Math.min(a[0]+a[2],b[0]+b[2]),y2=Math.min(a[1]+a[3],b[1]+b[3]);const i=Math.max(0,x2-x1)*Math.max(0,y2-y1);const u=a[2]*a[3]+b[2]*b[3]-i;return u>0?i/u:0;}
+function nms(dets,thr){dets.sort((a,b)=>b.score-a.score);const out=[];for(const d of dets){let ok=true;for(const o of out){if(o.cls===d.cls&&iou(o.box,d.box)>thr){ok=false;break;}}if(ok)out.push(d);}return out;}
+function decode(out,names,thr,size){
+  const o=out[Object.keys(out)[0]];const rows=o.dims[1],N=o.dims[2],d=o.data;const dets=[];
+  for(let i=0;i<N;i++){
+    let best=-1,bs=0;
+    for(let k=4;k<rows;k++){const v=d[k*N+i];if(v>bs){bs=v;best=k-4;}}
+    if(bs<thr||!names[best])continue;
+    const cx=d[i],cy=d[N+i],w=d[2*N+i],h=d[3*N+i];
+    dets.push({cls:names[best],score:bs,box:[cx-w/2,cy-h/2,w,h]});
+  }
+  return nms(dets,0.45);
+}
+function tensor(px,size){const n=size*size;const f=new Float32Array(3*n);for(let i=0,j=0;i<n;i++,j+=4){f[i]=px[j]/255;f[n+i]=px[j+1]/255;f[2*n+i]=px[j+2]/255;}return f;}`;
+
 const WORKER_SRC=`
-importScripts('${MP}/vision_bundle.js');
-const {ObjectDetector,FilesetResolver}=self.Vision;
-let det=null;
+importScripts('${ORT}ort.webgpu.min.js');
+ort.env.wasm.wasmPaths='${ORT}';
+ort.env.wasm.numThreads=1;
+${YOLO_LIB}
+let session=null,names=null,size=0,input='';
 self.onmessage=async e=>{
   const m=e.data;
   if(m.type==='init'){
     try{
-      const files=await FilesetResolver.forVisionTasks('${MP}/wasm');
-      det=await ObjectDetector.createFromOptions(files,{baseOptions:{modelAssetPath:m.model,delegate:m.delegate},runningMode:'VIDEO',scoreThreshold:${KEEP_SCORE},maxResults:30,categoryAllowlist:m.classes});
+      names=m.names;size=m.size;
+      session=await ort.InferenceSession.create(m.model,{executionProviders:m.eps});
+      input=session.inputNames[0];
       self.postMessage({type:'ready'});
     }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
     return;
   }
   if(m.type==='frame'){
     try{
-      const img=new ImageData(new Uint8ClampedArray(m.buf),m.w,m.h);
       const t0=performance.now();
-      const r=det.detectForVideo(img,m.ts);
-      const dets=r.detections.map(d=>({cls:d.categories[0].categoryName,score:d.categories[0].score,box:[d.boundingBox.originX,d.boundingBox.originY,d.boundingBox.width,d.boundingBox.height]}));
-      self.postMessage({type:'result',dets,ms:performance.now()-t0});
+      const out=await session.run({[input]:new ort.Tensor('float32',tensor(new Uint8ClampedArray(m.buf),size),[1,3,size,size])});
+      self.postMessage({type:'result',dets:decode(out,names,${KEEP_SCORE},size),ms:performance.now()-t0});
     }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
   }
 };`;
 
-function workerDetector(delegate){
+function workerDetector(eps){
   return new Promise((resolve,reject)=>{
     const url=URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'}));
     let w;
@@ -121,7 +145,7 @@ function workerDetector(delegate){
       if(m.type==='ready'){
         clearTimeout(timer);ready=true;
         resolve({
-          detect(img,ts){return new Promise((res,rej)=>{pending={resolve:res,reject:rej};w.postMessage({type:'frame',buf:img.data.buffer,w:img.width,h:img.height,ts},[img.data.buffer]);});},
+          detect(img,ts){return new Promise((res,rej)=>{pending={resolve:res,reject:rej};w.postMessage({type:'frame',buf:img.data.buffer,ts},[img.data.buffer]);});},
           close(){w.terminate();}
         });
       }else if(m.type==='result'){
@@ -130,27 +154,28 @@ function workerDetector(delegate){
         clearTimeout(timer);fail(new Error(m.message));
       }
     };
-    w.postMessage({type:'init',model:MODEL,delegate,classes:CLASSES});
+    w.postMessage({type:'init',model:MODEL,eps,names:WANT,size:SIZE});
   });
 }
 
-async function mainDetector(delegate){
-  const {ObjectDetector,FilesetResolver}=await import(MP+'/vision_bundle.mjs');
-  const files=await FilesetResolver.forVisionTasks(MP+'/wasm');
-  const det=await ObjectDetector.createFromOptions(files,{baseOptions:{modelAssetPath:MODEL,delegate},runningMode:'VIDEO',scoreThreshold:KEEP_SCORE,maxResults:30,categoryAllowlist:CLASSES});
+async function mainDetector(){
+  const ort=await import(ORT+'ort.min.mjs');
+  ort.env.wasm.wasmPaths=ORT;
+  ort.env.wasm.numThreads=1;
+  const lib=new Function(YOLO_LIB+';return {decode,tensor};')();
+  const session=await ort.InferenceSession.create(MODEL,{executionProviders:['wasm']});
+  const input=session.inputNames[0];
   return {
-    async detect(img,ts){
-      await sleep(0);
+    async detect(img){
       const t0=performance.now();
-      const r=det.detectForVideo(img,ts);
-      const dets=r.detections.map(d=>({cls:d.categories[0].categoryName,score:d.categories[0].score,box:[d.boundingBox.originX,d.boundingBox.originY,d.boundingBox.width,d.boundingBox.height]}));
-      return {dets,ms:performance.now()-t0};
+      const out=await session.run({[input]:new ort.Tensor('float32',lib.tensor(img.data,SIZE),[1,3,SIZE,SIZE])});
+      return {dets:lib.decode(out,WANT,KEEP_SCORE,SIZE),ms:performance.now()-t0};
     },
-    close(){det.close();}
+    close(){session.release();}
   };
 }
 
-const KINDS={wgpu:()=>workerDetector('GPU'),wcpu:()=>workerDetector('CPU'),main:()=>mainDetector('CPU')};
+const KINDS={wgpu:()=>workerDetector(['webgpu','wasm']),wcpu:()=>workerDetector(['wasm']),main:()=>mainDetector()};
 
 function withTimeout(p,ms){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('время ожидания вышло')),ms))]);}
 
@@ -158,7 +183,7 @@ async function videoReady(){while(!(video.readyState>=2&&video.videoWidth))await
 
 async function measure(d){
   await videoReady();
-  for(let i=0;i<2;i++)await withTimeout(d.detect(grabFrame().img,nextTs()),20000);
+  for(let i=0;i<2;i++)await withTimeout(d.detect(grabFrame().img,nextTs()),30000);
   const t=[];
   for(let i=0;i<3;i++){const t0=performance.now();await withTimeout(d.detect(grabFrame().img,nextTs()),20000);t.push(performance.now()-t0);}
   t.sort((a,b)=>a-b);
@@ -173,7 +198,7 @@ async function createDetector(){
   if(saved&&saved.model===MODEL&&KINDS[saved.kind]){
     try{const d=await KINDS[saved.kind]();kind=saved.kind;return d;}catch(e){}
   }
-  const tries=IOS?['wcpu']:['wgpu','wcpu'];
+  const tries=navigator.gpu?['wgpu','wcpu']:['wcpu'];
   const res=await Promise.allSettled(tries.map(k=>KINDS[k]()));
   const cands=[];
   res.forEach((r,i)=>{if(r.status==='fulfilled')cands.push({kind:tries[i],d:r.value,ms:Infinity});});
@@ -197,12 +222,20 @@ async function createDetector(){
 }
 
 async function fallbackDetector(){
-  if(detector){try{detector.close();}catch(e){}detector=null;}
+  for(const d of detectors){try{d.close();}catch(e){}}
+  detectors=[];
   try{localStorage.removeItem('backend');}catch(e){}
   for(const k of AFTER[kind]||[]){
-    try{const d=await KINDS[k]();kind=k;detector=d;return;}catch(e){}
+    try{const d=await KINDS[k]();kind=k;detectors=[d];return d;}catch(e){}
   }
   throw new Error('нейросеть недоступна');
+}
+
+function addWorkers(){
+  if(kind==='main')return;
+  for(let i=detectors.length;i<POOL;i++){
+    KINDS[kind]().then(d=>{if(running&&detectors.length&&detectors.length<POOL){detectors.push(d);detectLoop(d);}else d.close();}).catch(()=>{});
+  }
 }
 
 function errText(e){return e&&e.message?e.message:String(e);}
@@ -232,111 +265,243 @@ async function openCamera(){
   video.srcObject=stream;
   await video.play();
   if(!video.videoWidth){await Promise.race([new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true})),sleep(4000)]);}
-  tracks=[];
+  tracker.reset();
   try{localStorage.setItem('facing',facing);}catch(e){}
 }
 
 function grabFrame(){
-  const vw=video.videoWidth||2,vh=video.videoHeight||2;
-  const s=Math.min(1,FRAME_MAX/Math.max(vw,vh));
-  const fw=Math.max(2,Math.round(vw*s)),fh=Math.max(2,Math.round(vh*s));
-  if(fc.width!==fw||fc.height!==fh){fc.width=fw;fc.height=fh;}
-  fctx.drawImage(video,0,0,fw,fh);
-  return {img:fctx.getImageData(0,0,fw,fh),scale:vw/fw};
+  const vw=clean.width||2,vh=clean.height||2;
+  if(fc.width!==SIZE){fc.width=SIZE;fc.height=SIZE;fctx.imageSmoothingQuality='low';}
+  const r=Math.min(SIZE/vw,SIZE/vh);
+  const nw=Math.round(vw*r),nh=Math.round(vh*r);
+  const px=Math.round((SIZE-nw)/2),py=Math.round((SIZE-nh)/2);
+  fctx.fillStyle='rgb(114,114,114)';fctx.fillRect(0,0,SIZE,SIZE);
+  fctx.drawImage(clean,0,0,vw,vh,px,py,nw,nh);
+  return {img:fctx.getImageData(0,0,SIZE,SIZE),r,px,py,vw,vh};
+}
+function unbox(d,g){
+  let x=(d.box[0]-g.px)/g.r,y=(d.box[1]-g.py)/g.r,w=d.box[2]/g.r,h=d.box[3]/g.r;
+  if(x<0){w+=x;x=0;}if(y<0){h+=y;y=0;}
+  w=Math.min(g.vw-x,w);h=Math.min(g.vh-y,h);
+  return {cls:d.cls,score:d.score,box:[x,y,w,h]};
 }
 
-function interArea(a,b){
-  const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]);
-  const x2=Math.min(a[0]+a[2],b[0]+b[2]),y2=Math.min(a[1]+a[3],b[1]+b[3]);
-  return Math.max(0,x2-x1)*Math.max(0,y2-y1);
-}
-function iou(a,b){
-  const inter=interArea(a,b);
-  const uni=a[2]*a[3]+b[2]*b[3]-inter;
-  return uni>0?inter/uni:0;
-}
+function createTracker(o){
+  const P={keep:0.3,fresh:0.45,show:0.35,sure:0.7,matchIou:0.25,ttl:900,confirm:2,contain:0.9,partIn:0.7,partAccept:4,tau:60,histMs:1500,globalR:6,trackR:3,...o};
+  const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1};
 
-function suppress(dets){
-  dets.sort((a,b)=>b.score-a.score);
-  const out=[];
-  for(const d of dets){
-    const ad=d.box[2]*d.box[3];
-    if(ad<=0)continue;
-    let keep=true;
-    for(let i=0;i<out.length;i++){
-      const o=out[i];
-      if(o.cls!==d.cls)continue;
-      const inter=interArea(o.box,d.box);
-      const ao=o.box[2]*o.box[3];
-      if(ad<=ao){
-        if(inter/ad>=CONTAIN){keep=false;break;}
-      }else if(inter/ao>=CONTAIN&&d.score>=o.score-0.15){
-        out.splice(i,1);i--;
+  function interArea(a,b){
+    const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]);
+    const x2=Math.min(a[0]+a[2],b[0]+b[2]),y2=Math.min(a[1]+a[3],b[1]+b[3]);
+    return Math.max(0,x2-x1)*Math.max(0,y2-y1);
+  }
+  function iou(a,b){const i=interArea(a,b);const u=a[2]*a[3]+b[2]*b[3]-i;return u>0?i/u:0;}
+  function inside(a,b){const aa=a[2]*a[3];return aa>0?interArea(a,b)/aa:0;}
+
+  function sad(prev,cur,w,x,y,bw,bh,dx,dy,st){
+    let s=0;
+    for(let j=0;j<bh;j+=st){
+      const r0=(y+j)*w+x,r1=(y+j+dy)*w+x+dx;
+      for(let i=0;i<bw;i+=st)s+=Math.abs(prev[r0+i]-cur[r1+i]);
+    }
+    return s;
+  }
+  function texture(g,w,x,y,bw,bh,st){
+    let n=0,sum=0;
+    for(let j=0;j<bh;j+=st){const r=(y+j)*w+x;for(let i=0;i<bw;i+=st){sum+=g[r+i];n++;}}
+    const m=sum/n;let d=0;
+    for(let j=0;j<bh;j+=st){const r=(y+j)*w+x;for(let i=0;i<bw;i+=st)d+=Math.abs(g[r+i]-m);}
+    return d/n;
+  }
+  function sub(a,b,c){const d=a-2*b+c;return d>0?Math.max(-1,Math.min(1,0.5*(a-c)/d)):0;}
+
+  function match(prev,cur,w,h,x,y,bw,bh,cx,cy,R,st){
+    x=Math.round(x);y=Math.round(y);bw=Math.round(bw);bh=Math.round(bh);
+    const lim=R+Math.max(Math.abs(cx),Math.abs(cy));
+    if(x<lim){bw-=lim-x;x=lim;}
+    if(y<lim){bh-=lim-y;y=lim;}
+    if(x+bw>w-lim)bw=w-lim-x;
+    if(y+bh>h-lim)bh=h-lim-y;
+    if(bw<4||bh<4)return null;
+    if(texture(prev,w,x,y,bw,bh,st)<2.5)return null;
+    const n=2*R+1,S=new Float64Array(n*n);
+    let best=Infinity,bi=0,bj=0;
+    for(let j=-R;j<=R;j++)for(let i=-R;i<=R;i++){
+      const v=sad(prev,cur,w,x,y,bw,bh,cx+i,cy+j,st);
+      S[(j+R)*n+(i+R)]=v;
+      if(v<best){best=v;bi=i;bj=j;}
+    }
+    let fx=0,fy=0;
+    const c=(bj+R)*n+(bi+R);
+    if(bi>-R&&bi<R)fx=sub(S[c-1],S[c],S[c+1]);
+    if(bj>-R&&bj<R)fy=sub(S[c-n],S[c],S[c+n]);
+    return {dx:cx+bi+fx,dy:cy+bj+fy};
+  }
+
+  function region(b){
+    const s=T.scale;
+    const bw=b[2]*0.6/s,bh=b[3]*0.8/s;
+    const a=bw*bh;
+    return {x:(b[0]+b[2]*0.2)/s,y:(b[1]+b[3]*0.1)/s,bw,bh,st:a>6000?3:a>1500?2:1};
+  }
+
+  function radius(base,dt,cap){return Math.min(cap,Math.max(base,Math.ceil(base*dt/33)));}
+
+  function step(prev,cur,b,gdx,gdy){
+    const r=region(b);
+    const R=radius(P.trackR,cur.t-prev.t,8);
+    const m=match(prev.g,cur.g,T.w,T.h,r.x,r.y,r.bw,r.bh,Math.round(gdx),Math.round(gdy),R,r.st);
+    const s=T.scale;
+    return m?[m.dx*s,m.dy*s]:[gdx*s,gdy*s];
+  }
+
+  function motionStep(gray,w,h,scale,now){
+    if(w!==T.w||h!==T.h||scale!==T.scale){T.frames=[];T.w=w;T.h=h;T.scale=scale;}
+    const prev=T.frames[T.frames.length-1];
+    const cur={t:now,g:gray,gdx:0,gdy:0};
+    if(prev){
+      const R=radius(P.globalR,now-prev.t,12);
+      const g=match(prev.g,gray,w,h,R,R,w-2*R,h-2*R,0,0,R,3);
+      if(g){cur.gdx=g.dx;cur.gdy=g.dy;}
+      for(const t of T.tracks){
+        const [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy);
+        t.pos[0]+=dx;t.pos[1]+=dy;t.box[0]+=dx;t.box[1]+=dy;
+        t.hist.push({t:now,dx,dy});
+        while(t.hist.length&&t.hist[0].t<now-P.histMs)t.hist.shift();
       }
     }
-    if(keep)out.push(d);
+    T.frames.push(cur);
+    while(T.frames.length&&T.frames[0].t<now-P.histMs)T.frames.shift();
   }
-  return out;
-}
 
-function predict(t,now){
-  const h=Math.min(250,Math.max(0,now-t.tDet))/1000*0.7;
-  return [t.target[0]+t.vel[0]*h,t.target[1]+t.vel[1]*h,t.target[2]+t.vel[2]*h,t.target[3]+t.vel[3]*h];
-}
+  function replay(box,ts){
+    const f=T.frames;
+    let i=0;
+    while(i<f.length&&f[i].t<ts-10)i++;
+    const b=box.slice();
+    for(;i+1<f.length;i++){
+      const [dx,dy]=step(f[i],f[i+1],b,f[i+1].gdx,f[i+1].gdy);
+      b[0]+=dx;b[1]+=dy;
+    }
+    return b;
+  }
 
-function updateTracks(dets,now,ts){
-  dets=suppress(dets.filter(d=>d.score>=KEEP_SCORE&&CLASSES.includes(d.cls)));
-  const pairs=[];
-  tracks.forEach((t,i)=>{
-    const p=predict(t,ts);
+  function sumSince(h,ts){
+    let dx=0,dy=0;
+    for(let i=h.length-1;i>=0&&h[i].t>ts;i--){dx+=h[i].dx;dy+=h[i].dy;}
+    return [dx,dy];
+  }
+  function posAt(t,ts){const [dx,dy]=sumSince(t.hist,ts);return [t.pos[0]-dx,t.pos[1]-dy,t.pos[2],t.pos[3]];}
+
+  function suppress(dets){
+    dets.sort((a,b)=>b.score-a.score);
+    const out=[];
+    for(const d of dets){
+      const ad=d.box[2]*d.box[3];
+      if(ad<=0)continue;
+      let keep=true;
+      for(let i=0;i<out.length;i++){
+        const o=out[i];
+        if(o.cls!==d.cls)continue;
+        const ao=o.box[2]*o.box[3];
+        if(ad<=ao){if(inside(d.box,o.box)>=P.contain){keep=false;break;}}
+        else if(inside(o.box,d.box)>=P.contain&&d.score>=P.keep){out.splice(i,1);i--;}
+      }
+      if(keep)out.push(d);
+    }
+    return out;
+  }
+
+  function adopt(t,d,ts,now){
+    const nb=d.now||(d.now=replay(d.box,ts));
+    for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*0.3+nb[k]*0.7;
+    t.tDet=ts;t.score=t.score*0.6+d.score*0.4;t.hits++;t.miss=0;t.lastSeen=now;t.part=0;
+  }
+
+  function update(dets,ts,now){
+    dets=suppress(dets.filter(d=>d.score>=P.keep));
+    const tr=T.tracks;
+    const at=tr.map(t=>posAt(t,ts));
+    const usedT=new Set(),usedD=new Set();
+    const pairs=[];
+    tr.forEach((t,i)=>dets.forEach((d,j)=>{if(d.cls!==t.cls)return;const v=iou(at[i],d.box);if(v>=P.matchIou)pairs.push([v,i,j]);}));
+    pairs.sort((a,b)=>b[0]-a[0]);
+    for(const [,i,j] of pairs){
+      if(usedT.has(i)||usedD.has(j))continue;
+      usedT.add(i);usedD.add(j);adopt(tr[i],dets[j],ts,now);
+    }
     dets.forEach((d,j)=>{
-      if(d.cls!==t.cls)return;
-      const v=iou(p,d.box);
-      if(v>=MATCH_IOU)pairs.push([v,i,j]);
+      if(usedD.has(j))return;
+      d.now=replay(d.box,ts);
+      let bi=-1,bv=0;
+      tr.forEach((t,i)=>{if(usedT.has(i)||t.cls!==d.cls)return;const v=iou(t.pos,d.now);if(v>=P.matchIou&&v>bv){bv=v;bi=i;}});
+      if(bi>=0){usedT.add(bi);usedD.add(j);adopt(tr[bi],d,ts,now);}
     });
-  });
-  pairs.sort((a,b)=>b[0]-a[0]);
-  const usedT=new Set(),usedD=new Set();
-  for(const [,i,j] of pairs){
-    if(usedT.has(i)||usedD.has(j))continue;
-    usedT.add(i);usedD.add(j);
-    const t=tracks[i],d=dets[j];
-    const dt=(ts-t.tDet)/1000;
-    if(dt>0.01){for(let k=0;k<4;k++){t.vel[k]=t.vel[k]*0.5+((d.box[k]-t.target[k])/dt)*0.5;}}
-    t.target=d.box.slice();t.tDet=ts;
-    t.score=t.score*0.6+d.score*0.4;
-    t.hits++;t.miss=0;t.lastSeen=now;
+    dets.forEach((d,j)=>{
+      if(usedD.has(j))return;
+      let bi=-1,bv=0;
+      tr.forEach((t,i)=>{if(usedT.has(i)||t.cls!==d.cls)return;const v=Math.max(inside(at[i],d.box),inside(t.pos,d.now));if(v>=P.partIn&&v>bv){bv=v;bi=i;}});
+      if(bi>=0){usedT.add(bi);usedD.add(j);adopt(tr[bi],d,ts,now);}
+    });
+    dets.forEach((d,j)=>{
+      if(usedD.has(j))return;
+      let bi=-1,bv=0;
+      tr.forEach((t,i)=>{if(usedT.has(i)||t.cls!==d.cls)return;const v=Math.max(inside(d.box,at[i]),inside(d.now,t.pos));if(v>=P.partIn&&v>bv){bv=v;bi=i;}});
+      if(bi<0)return;
+      const t=tr[bi];usedT.add(bi);usedD.add(j);
+      t.part++;
+      if(t.part>=P.partAccept)adopt(t,d,ts,now);
+      else{t.tDet=ts;t.miss=0;t.lastSeen=now;t.hits++;t.score=Math.max(t.score*0.9,d.score);}
+    });
+    tr.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.9;}});
+    dets.forEach((d,j)=>{
+      if(usedD.has(j)||d.score<P.fresh)return;
+      for(const t of tr)if(t.cls===d.cls&&inside(d.now,t.pos)>=P.partIn)return;
+      tr.push({id:T.nextId++,cls:d.cls,pos:d.now.slice(),box:d.now.slice(),hist:[],tDet:ts,score:d.score,hits:1,miss:0,part:0,lastSeen:now});
+    });
+    T.tracks=tr.filter(t=>{
+      const fw=T.w*T.scale,fh=T.h*T.scale;
+      const vis=fw&&fh?inside(t.pos,[0,0,fw,fh]):1;
+      return now-t.lastSeen<=(vis<0.5?P.ttl*0.35:P.ttl);
+    });
   }
-  tracks.forEach((t,i)=>{if(!usedT.has(i)){t.miss++;t.score*=0.9;}});
-  dets.forEach((d,j)=>{
-    if(usedD.has(j)||d.score<NEW_SCORE)return;
-    tracks.push({id:nextId++,cls:d.cls,box:d.box.slice(),target:d.box.slice(),vel:[0,0,0,0],tDet:ts,score:d.score,hits:1,miss:0,lastSeen:now});
-  });
-  tracks=tracks.filter(t=>now-t.lastSeen<=TTL);
-}
 
-async function detectLoop(){
-  while(running){
-    if(!detector){await sleep(100);continue;}
-    if(!(video.readyState>=2&&video.videoWidth)){await sleep(50);continue;}
-    const {img,scale}=grabFrame();
-    const ts=nextTs();
+  function smooth(now,dt){
+    const a=1-Math.exp(-dt/P.tau);
+    for(const t of T.tracks)for(let k=0;k<4;k++)t.box[k]+=(t.pos[k]-t.box[k])*a;
+  }
+  function visible(t){return t.score>=P.show&&(t.hits>=P.confirm||t.score>=P.sure);}
+  function reset(){T.tracks=[];T.frames=[];}
+  return {P,T,motionStep,update,smooth,visible,reset,get tracks(){return T.tracks;}};
+}
+const tracker=createTracker({});
+if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;}
+
+async function detectLoop(det){
+  while(running&&detectors.includes(det)){
+    if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)){await sleep(50);continue;}
+    const g=grabFrame();
+    const ts=cleanTs;
     try{
-      const r=await detector.detect(img,ts);
+      const r=await det.detect(g.img,ts);
       const now=performance.now();
       inferMs=inferMs?inferMs*0.8+r.ms*0.2:r.ms;
-      updateTracks(r.dets.map(d=>({cls:d.cls,score:d.score,box:[d.box[0]*scale,d.box[1]*scale,d.box[2]*scale,d.box[3]*scale]})),now,ts);
+      tracker.update(r.dets.map(d=>unbox(d,g)).filter(d=>d.box[2]>1&&d.box[3]>1),ts,now);
     }catch(e){
+      const i=detectors.indexOf(det);
+      if(i>=0)detectors.splice(i,1);
+      try{det.close();}catch(e2){}
+      if(detectors.length)return;
       toast('Переключаю нейросеть…',0);
-      try{await fallbackDetector();inferMs=0;toast('Нейросеть: '+LABEL[kind],1500);}
-      catch(e2){detector=null;if(running)toast('Нейросеть остановилась: '+errText(e)+'. Откройте страницу заново.',0);return;}
+      try{const d=await fallbackDetector();inferMs=0;toast('Нейросеть: '+LABEL[kind],1500);detectLoop(d);}
+      catch(e2){if(running)toast('Нейросеть остановилась: '+errText(e)+'. Откройте страницу заново.',0);}
+      return;
     }
   }
 }
 
 function visible(t){
-  if(t.score<SHOW_SCORE)return false;
-  if(t.hits<CONFIRM_HITS&&t.score<SURE_SCORE)return false;
+  if(!tracker.visible(t))return false;
   if(mode==='person')return t.cls==='person';
   if(mode==='animal')return t.cls!=='person';
   return true;
@@ -344,7 +509,7 @@ function visible(t){
 
 function drawBox(x,y,w,h,t){
   const s=Math.max(1,canvas.width/640);
-  const color=t.miss>0?'#ffcc33':(t.cls==='person'?'#39ff7a':'#3ad7ff');
+  const color=t.miss>1?'#ffcc33':(t.cls==='person'?'#39ff7a':'#3ad7ff');
   ctx.strokeStyle=color;
   ctx.globalAlpha=0.55;
   ctx.lineWidth=1.5*s;
@@ -379,16 +544,24 @@ function render(){
   if(canvas.width!==vw||canvas.height!==vh){canvas.width=vw;canvas.height=vh;}
   const now=performance.now();
   const dt=Math.min(100,now-lastFrame);lastFrame=now;
-  const a=1-Math.exp(-dt/70);
   const mirror=facing==='user';
+  if(clean.width!==vw||clean.height!==vh){clean.width=vw;clean.height=vh;}
+  cctx.drawImage(video,0,0,vw,vh);
+  cleanTs=now;
   ctx.save();
   if(mirror){ctx.translate(vw,0);ctx.scale(-1,1);}
-  ctx.drawImage(video,0,0,vw,vh);
+  ctx.drawImage(clean,0,0,vw,vh);
   ctx.restore();
+  const sw=Math.max(16,Math.round(vw/8)),sh=Math.max(9,Math.round(vh/8));
+  if(gc.width!==sw||gc.height!==sh){gc.width=sw;gc.height=sh;gctx.imageSmoothingEnabled=false;}
+  gctx.drawImage(clean,0,0,sw,sh);
+  const px=gctx.getImageData(0,0,sw,sh).data;
+  const gray=new Uint8Array(sw*sh);
+  for(let i=0,j=0;i<gray.length;i++,j+=4)gray[i]=(px[j]*77+px[j+1]*150+px[j+2]*29)>>8;
+  tracker.motionStep(gray,sw,sh,vw/sw,now);
+  tracker.smooth(now,dt);
   let nP=0,nA=0;
-  for(const t of tracks){
-    const p=predict(t,now);
-    for(let k=0;k<4;k++)t.box[k]+=(p[k]-t.box[k])*a;
+  for(const t of tracker.tracks){
     if(!visible(t))continue;
     if(t.cls==='person')nP++;else nA++;
     let [x,y,w,h]=t.box;
@@ -398,7 +571,7 @@ function render(){
   fpsN++;
   if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;}
   cnt.textContent=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
-  perf.textContent=Math.round(fps)+' FPS'+(detector?' · '+Math.round(inferMs)+' мс · '+LABEL[kind]:' · загрузка…');
+  perf.textContent=Math.round(fps)+' FPS'+(detectors.length?' · '+Math.round(inferMs)+' мс · '+LABEL[kind]+(detectors.length>1?'×'+detectors.length:''):' · загрузка…');
 }
 
 function setMode(m){
@@ -531,9 +704,11 @@ go.addEventListener('click',async()=>{
   render();
   toast('Загружаю нейросеть…',0);
   try{
-    detector=await createDetector();
+    const d=await createDetector();
+    detectors=[d];
     toast('Нейросеть готова · '+LABEL[kind],1500);
-    detectLoop();
+    detectLoop(d);
+    addWorkers();
   }catch(e){
     toast('Не удалось загрузить нейросеть: '+errText(e)+'. Проверьте интернет и откройте страницу заново.',0);
   }
