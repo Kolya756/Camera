@@ -62,8 +62,8 @@ const ANIMALS=['bird','cat','dog','horse','sheep','cow','elephant','bear','zebra
 const CLASSES=['person',...ANIMALS];
 const RU={person:'ЧЕЛОВЕК',bird:'ПТИЦА',cat:'КОШКА',dog:'СОБАКА',horse:'ЛОШАДЬ',sheep:'ОВЦА',cow:'КОРОВА',elephant:'СЛОН',bear:'МЕДВЕДЬ',zebra:'ЗЕБРА',giraffe:'ЖИРАФ'};
 const KEEP_SCORE=0.3;
-const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·'};
-const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[]};
+const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·',fake:'TEST'};
+const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[],fake:[]};
 const WANT=COCO.map(c=>CLASSES.includes(c)?c:'');
 const IOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 
@@ -191,6 +191,11 @@ async function measure(d){
 }
 
 async function createDetector(){
+  const fake=new URLSearchParams(location.search).get('fakedet');
+  if(fake!==null&&window.__fakeDets){
+    kind='fake';
+    return {async detect(){await sleep(parseInt(fake)||250);return {dets:window.__fakeDets(clean,SIZE),ms:parseInt(fake)||250};},close(){}};
+  }
   const force=new URLSearchParams(location.search).get('backend');
   if(force&&KINDS[force]){kind=force;return KINDS[force]();}
   let saved=null;
@@ -232,7 +237,7 @@ async function fallbackDetector(){
 }
 
 function addWorkers(){
-  if(kind==='main')return;
+  if(kind==='main'||kind==='fake')return;
   for(let i=detectors.length;i<POOL;i++){
     KINDS[kind]().then(d=>{if(running&&detectors.length&&detectors.length<POOL){detectors.push(d);detectLoop(d);}else d.close();}).catch(()=>{});
   }
@@ -313,7 +318,7 @@ function createTracker(o){
     for(let j=0;j<bh;j+=st){const r=(y+j)*w+x;for(let i=0;i<bw;i+=st)d+=Math.abs(g[r+i]-m);}
     return d/n;
   }
-  function sub(a,b,c){const d=a-2*b+c;return d>0?Math.max(-1,Math.min(1,0.5*(a-c)/d)):0;}
+  function sub(a,b,c){const d=2*Math.max(a-b,c-b);return d>0?Math.max(-1,Math.min(1,(a-c)/d)):0;}
 
   function match(prev,cur,w,h,x,y,bw,bh,cx,cy,R,st){
     x=Math.round(x);y=Math.round(y);bw=Math.round(bw);bh=Math.round(bh);
@@ -335,7 +340,7 @@ function createTracker(o){
     const c=(bj+R)*n+(bi+R);
     if(bi>-R&&bi<R)fx=sub(S[c-1],S[c],S[c+1]);
     if(bj>-R&&bj<R)fy=sub(S[c-n],S[c],S[c+n]);
-    return {dx:cx+bi+fx,dy:cy+bj+fy};
+    return {dx:cx+bi+fx,dy:cy+bj+fy,sad:best};
   }
 
   function region(b){
@@ -347,24 +352,48 @@ function createTracker(o){
 
   function radius(base,dt,cap){return Math.min(cap,Math.max(base,Math.ceil(base*dt/33)));}
 
-  function step(prev,cur,b,gdx,gdy){
+  function half(g,w,h){
+    const w2=w>>1,h2=h>>1,o=new Uint8Array(w2*h2);
+    for(let y=0;y<h2;y++){const r0=2*y*w,r1=r0+w;for(let x=0;x<w2;x++){const i=2*x;o[y*w2+x]=(g[r0+i]+g[r0+i+1]+g[r1+i]+g[r1+i+1])>>2;}}
+    return o;
+  }
+
+  function global(prev,cur,w,h,dt){
+    const w2=w>>1,h2=h>>1;
+    const R2=radius(4,dt,10);
+    const c=match(prev.g2,cur.g2,w2,h2,R2,R2,w2-2*R2,h2-2*R2,0,0,R2,2);
+    const cx=c?Math.round(c.dx*2):0,cy=c?Math.round(c.dy*2):0;
+    const lim=2+Math.max(Math.abs(cx),Math.abs(cy));
+    const f=match(prev.g,cur.g,w,h,lim,lim,w-2*lim,h-2*lim,cx,cy,2,3);
+    return f?[f.dx,f.dy]:(c?[c.dx*2,c.dy*2]:[0,0]);
+  }
+
+  function step(prev,cur,b,gdx,gdy,vx,vy){
     const r=region(b);
     const R=radius(P.trackR,cur.t-prev.t,8);
-    const m=match(prev.g,cur.g,T.w,T.h,r.x,r.y,r.bw,r.bh,Math.round(gdx),Math.round(gdy),R,r.st);
+    const cands=[[Math.round(gdx),Math.round(gdy)]];
+    for(const c of [[0,0],[Math.round(vx||0),Math.round(vy||0)]]){
+      if(cands.every(k=>k[0]!==c[0]||k[1]!==c[1]))cands.push(c);
+    }
+    let best=null;
+    for(const c of cands){
+      const m=match(prev.g,cur.g,T.w,T.h,r.x,r.y,r.bw,r.bh,c[0],c[1],R,r.st);
+      if(m&&(!best||m.sad<best.sad))best=m;
+    }
     const s=T.scale;
-    return m?[m.dx*s,m.dy*s]:[gdx*s,gdy*s];
+    return best?[best.dx*s,best.dy*s]:[gdx*s,gdy*s];
   }
 
   function motionStep(gray,w,h,scale,now){
     if(w!==T.w||h!==T.h||scale!==T.scale){T.frames=[];T.w=w;T.h=h;T.scale=scale;}
     const prev=T.frames[T.frames.length-1];
-    const cur={t:now,g:gray,gdx:0,gdy:0};
+    const cur={t:now,g:gray,g2:half(gray,w,h),gdx:0,gdy:0};
     if(prev){
-      const R=radius(P.globalR,now-prev.t,12);
-      const g=match(prev.g,gray,w,h,R,R,w-2*R,h-2*R,0,0,R,3);
-      if(g){cur.gdx=g.dx;cur.gdy=g.dy;}
+      const g=global(prev,cur,w,h,now-prev.t);
+      cur.gdx=g[0];cur.gdy=g[1];
       for(const t of T.tracks){
-        const [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy);
+        const lh=t.hist[t.hist.length-1];
+        const [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
         t.pos[0]+=dx;t.pos[1]+=dy;t.box[0]+=dx;t.box[1]+=dy;
         t.hist.push({t:now,dx,dy});
         while(t.hist.length&&t.hist[0].t<now-P.histMs)t.hist.shift();
@@ -379,9 +408,10 @@ function createTracker(o){
     let i=0;
     while(i<f.length&&f[i].t<ts-10)i++;
     const b=box.slice();
+    let vx=0,vy=0;
     for(;i+1<f.length;i++){
-      const [dx,dy]=step(f[i],f[i+1],b,f[i+1].gdx,f[i+1].gdy);
-      b[0]+=dx;b[1]+=dy;
+      const [dx,dy]=step(f[i],f[i+1],b,f[i+1].gdx,f[i+1].gdy,vx,vy);
+      b[0]+=dx;b[1]+=dy;vx=dx/T.scale;vy=dy/T.scale;
     }
     return b;
   }
@@ -472,7 +502,7 @@ function createTracker(o){
   }
   function visible(t){return t.score>=P.show&&(t.hits>=P.confirm||t.score>=P.sure);}
   function reset(){T.tracks=[];T.frames=[];}
-  return {P,T,motionStep,update,smooth,visible,reset,get tracks(){return T.tracks;}};
+  return {P,T,motionStep,update,smooth,visible,reset,match,step,get tracks(){return T.tracks;}};
 }
 const tracker=createTracker({});
 if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;}
@@ -553,7 +583,7 @@ function render(){
   ctx.drawImage(clean,0,0,vw,vh);
   ctx.restore();
   const sw=Math.max(16,Math.round(vw/8)),sh=Math.max(9,Math.round(vh/8));
-  if(gc.width!==sw||gc.height!==sh){gc.width=sw;gc.height=sh;gctx.imageSmoothingEnabled=false;}
+  if(gc.width!==sw||gc.height!==sh){gc.width=sw;gc.height=sh;gctx.imageSmoothingEnabled=true;gctx.imageSmoothingQuality='high';}
   gctx.drawImage(clean,0,0,sw,sh);
   const px=gctx.getImageData(0,0,sw,sh).data;
   const gray=new Uint8Array(sw*sh);
