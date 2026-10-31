@@ -61,7 +61,7 @@ const ORT='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
 const MODELS={n512:{name:'n',size:512},n640:{name:'n',size:640},s512:{name:'s',size:512}};
 let MKEY='n512',SIZE=512;
 const MVER='v3';
-const SLOW_MS=300,FAST_MS=110;
+const SLOW_MS=300,FAST_MS=200,S_MS=420;
 const FOCUS=!new URLSearchParams(location.search).has('nofocus');
 function modelUrl(k){const m=MODELS[k];return new URL('model_'+m.name+m.size+'.onnx',location.href).href;}
 function setModel(k){MKEY=k;SIZE=MODELS[k].size;}
@@ -246,7 +246,7 @@ async function createDetector(){
     for(const cand of ['s512','n640']){
       let d2=null,ms2=Infinity;
       try{setModel(cand);d2=await KINDS[kind](cand);ms2=await measure(d2);}catch(e){if(d2)d2.close();d2=null;}
-      if(d2&&ms2<=SLOW_MS){base.d.close();best={kind,d:d2,ms:ms2};break;}
+      if(d2&&ms2<=(cand==='s512'?S_MS:SLOW_MS)){base.d.close();best={kind,d:d2,ms:ms2};break;}
       if(d2)d2.close();
       setModel(base.model);
     }
@@ -339,7 +339,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshSmall:0.33,smallH:0.1,confirmSmall:2,show:0.3,sure:0.7,matchIou:0.25,lowIou:0.35,ttl:800,ttlEst:1500,confirm:2,establish:3,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshSmall:0.3,smallH:0.1,confirmSmall:2,show:0.3,sure:0.7,matchIou:0.25,lowIou:0.35,ttl:800,ttlEst:1500,ttlStatic:2500,confirm:2,establish:3,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.7,crossScore:0.6,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -585,7 +585,8 @@ function createTracker(o){
     T.tracks=tr.filter(t=>{
       const fw=T.w*T.scale,fh=T.h*T.scale;
       const vis=fw&&fh?inside(t.pos,[0,0,fw,fh]):1;
-      const ttl=(t.hits>=P.establish&&t.peak>=P.sure*0.8)?P.ttlEst:P.ttl;
+      const est=t.hits>=P.establish&&t.peak>=P.sure*0.8;
+      const ttl=est?(moving(t,now)<2?P.ttlStatic:P.ttlEst):P.ttl;
       return now-t.lastSeen<=(vis<0.5?ttl*0.3:ttl);
     });
   }
