@@ -303,6 +303,7 @@ async function openCamera(){
   try{localStorage.setItem('facing',facing);}catch(e){}
 }
 
+let sweep=0;
 function focusRoi(vw,vh){
   const small=tracker.tracks.filter(t=>visible(t)&&t.box[3]<0.15*vh);
   let cx=vw/2,cy=vh/2;
@@ -310,6 +311,9 @@ function focusRoi(vw,vh){
     let x1=Infinity,y1=Infinity,x2=-Infinity,y2=-Infinity;
     for(const t of small){x1=Math.min(x1,t.box[0]);y1=Math.min(y1,t.box[1]);x2=Math.max(x2,t.box[0]+t.box[2]);y2=Math.max(y2,t.box[1]+t.box[3]);}
     cx=(x1+x2)/2;cy=(y1+y2)/2;
+  }else{
+    const spots=[[0.5,0.5],[0.3,0.3],[0.7,0.3],[0.5,0.3],[0.3,0.6],[0.7,0.6]];
+    const sp=spots[sweep++%spots.length];cx=vw*sp[0];cy=vh*sp[1];
   }
   const rw=vw/2,rh=vh/2;
   const x=Math.max(0,Math.min(vw-rw,cx-rw/2)),y=Math.max(0,Math.min(vh-rh,cy-rh/2));
@@ -724,6 +728,7 @@ function render(){
     drawBox(x,y,w,h,t);
   }
   if(DIAG&&now-diagT>500){diagT=now;diagEl.textContent=diagText(now);}
+  if(recorder&&now-recFrameT>=41){recFrameT=now;rctx.drawImage(canvas,0,0,rc.width,rc.height);if(recTrack)recTrack.requestFrame();}
   fpsN++;
   if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;}
   cnt.textContent=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
@@ -765,7 +770,9 @@ shot.addEventListener('click',()=>{
   canvas.toBlob(b=>{if(b)deliver(new File([b],name,{type:'image/jpeg'}));},'image/jpeg',0.9);
 });
 
-let recorder=null,recChunks=[],recStream=null,recStart=0,recTick=null,pendingFile=null,stopping=false;
+let recorder=null,recChunks=[],recStream=null,recStart=0,recTick=null,pendingFile=null,stopping=false,recTrack=null,recFrameT=0;
+const rc=document.createElement('canvas');
+const rctx=rc.getContext('2d');
 function pickMime(){
   if(typeof MediaRecorder==='undefined')return null;
   for(const t of ['video/mp4;codecs=avc1.42E01E','video/mp4','video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'])if(MediaRecorder.isTypeSupported(t))return t;
@@ -777,7 +784,13 @@ function startRec(){
   if(mime===null||!canvas.captureStream){toast('Этот браузер не умеет записывать видео');return;}
   hideSave();
   try{
-    recStream=canvas.captureStream(24);
+    const rs=Math.min(1,960/Math.max(canvas.width,canvas.height));
+    rc.width=Math.round(canvas.width*rs);rc.height=Math.round(canvas.height*rs);
+    rctx.drawImage(canvas,0,0,rc.width,rc.height);
+    recTrack=null;
+    try{recStream=rc.captureStream(0);recTrack=recStream.getVideoTracks()[0];if(!recTrack||typeof recTrack.requestFrame!=='function'){recTrack=null;recStream=rc.captureStream(24);}}
+    catch(e){recStream=rc.captureStream(24);}
+    recFrameT=0;
     const opts={videoBitsPerSecond:3000000};
     if(mime)opts.mimeType=mime;
     recorder=new MediaRecorder(recStream,opts);
@@ -792,7 +805,7 @@ function startRec(){
     const type=(recorder.mimeType||mime||'video/webm').split(';')[0];
     const blob=new Blob(recChunks,{type});
     recChunks=[];
-    recStream.getTracks().forEach(t=>t.stop());recStream=null;recorder=null;stopping=false;
+    recStream.getTracks().forEach(t=>t.stop());recStream=null;recorder=null;recTrack=null;stopping=false;
     clearInterval(recTick);
     record.classList.remove('live');record.textContent='Запись';record.disabled=false;rec.hidden=true;flip.disabled=false;
     const sec=Math.round((performance.now()-recStart)/1000);
