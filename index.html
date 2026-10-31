@@ -58,20 +58,47 @@ video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
 </div>
 <script type="module">
 const ORT='https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.1/dist/';
-const MODELS={n512:{name:'n',size:512},n640:{name:'n',size:640},s512:{name:'s',size:512}};
-let MKEY='n512',SIZE=512;
-const MVER='v3';
-const SLOW_MS=300,FAST_MS=200,S_MS=420;
+const PARAMS=new URLSearchParams(location.search);
+const ISO=!!window.crossOriginIsolated&&typeof SharedArrayBuffer!=='undefined';
+const THREADS=Math.max(1,Math.min(4,parseInt(PARAMS.get('threads'))||(ISO?Math.min(4,(navigator.hardwareConcurrency||2)-1):1)));
+let started=false,swOff=false;
+try{swOff=localStorage.getItem('nosw')==='1';}catch(e){}
+const SW_OK='serviceWorker' in navigator&&location.protocol!=='file:'&&!PARAMS.has('nosw')&&!swOff;
+if(SW_OK&&!ISO){
+  navigator.serviceWorker.register('coi-serviceworker.js').then(()=>navigator.serviceWorker.ready).then(()=>{
+    let done=false;
+    try{done=sessionStorage.getItem('coi')==='1';sessionStorage.setItem('coi','1');}catch(e){}
+    if(!done&&!started&&!navigator.serviceWorker.controller)location.reload();
+  }).catch(()=>{});
+}
+async function dropSw(){
+  try{localStorage.setItem('nosw','1');const rs=await navigator.serviceWorker.getRegistrations();for(const r of rs)await r.unregister();}catch(e){}
+}
+const MODELS={n512:{name:'n',size:512,file:'n512p'},n640:{name:'n',size:640,file:'n640p'},nrect:{name:'n',size:512,rect:1,file:'nrect'},s416:{name:'s',size:416,file:'s416p'},s512:{name:'s',size:512,file:'s512p'},srect:{name:'s',size:512,rect:1,file:'srect'}};
+let MKEY='nrect',SIZE=512;
+const MVER='v5';
+const RECT=[384,672];
+const PACE=PARAMS.get('pace')!=='0';
+const VERIFY_ON=PARAMS.get('verify')==='1';
+const VERIFY_MIN=parseInt(PARAMS.get('vmin'))||120,VERIFY_LUMA=parseInt(PARAMS.get('vluma'))||50;
+const ANIMAL_IDX=[[7,24],[80,100],[127,146],[151,299],[339,353],[385,386],[850,850]];
+const CAT_IDX=[281,285],DOG_IDX=[151,268];
+let verifyOk=false,verifyId=0,verifyBusy=false;
+const REC_STAT=PARAMS.has('debug')?[]:null;
+const vc=document.createElement('canvas');
+const vctx=vc.getContext('2d',{willReadFrequently:true});
+const SLOW_MS=300,FAST_MS=200,S_MS=450;
 const FOCUS=!new URLSearchParams(location.search).has('nofocus');
-function modelUrl(k){const m=MODELS[k];return new URL('model_'+m.name+m.size+'.onnx',location.href).href;}
+function modelUrl(k){const m=MODELS[k];return new URL('model_'+m.file+'.onnx',location.href).href;}
+function inputDims(k,vw,vh){const m=MODELS[k];if(!m.rect)return [m.size,m.size];return vw<vh?[RECT[0],RECT[1]]:[RECT[1],RECT[0]];}
 function setModel(k){MKEY=k;SIZE=MODELS[k].size;}
 const COCO=['person','bicycle','car','motorcycle','airplane','bus','train','truck','boat','traffic light','fire hydrant','stop sign','parking meter','bench','bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe','backpack','umbrella','handbag','tie','suitcase','frisbee','skis','snowboard','sports ball','kite','baseball bat','baseball glove','skateboard','surfboard','tennis racket','bottle','wine glass','cup','fork','knife','spoon','bowl','banana','apple','sandwich','orange','broccoli','carrot','hot dog','pizza','donut','cake','chair','couch','potted plant','bed','dining table','toilet','tv','laptop','mouse','remote','keyboard','cell phone','microwave','oven','toaster','sink','refrigerator','book','clock','vase','scissors','teddy bear','hair drier','toothbrush'];
 const ANIMALS=['bird','cat','dog','horse','sheep','cow','elephant','bear','zebra','giraffe'];
 const CLASSES=['person',...ANIMALS];
 const RU={person:'ЧЕЛОВЕК',bird:'ПТИЦА',cat:'КОШКА',dog:'СОБАКА',horse:'ЛОШАДЬ',sheep:'ОВЦА',cow:'КОРОВА',elephant:'СЛОН',bear:'МЕДВЕДЬ',zebra:'ЗЕБРА',giraffe:'ЖИРАФ'};
 const KEEP_SCORE=0.15;
-const LABEL={wgpu:'GPU',wcpu:'CPU',main:'CPU·',fake:'TEST'};
-const AFTER={wgpu:['wcpu','main'],wcpu:['main'],main:[],fake:[]};
+const LABEL={wgpu:'GPU',mgpu:'GPU·',wcpu:'CPU',main:'CPU·',fake:'TEST'};
+const AFTER={wgpu:['mgpu','wcpu','main'],mgpu:['wcpu','main'],wcpu:['main'],main:[],fake:[]};
 const WANT=COCO.map(c=>CLASSES.includes(c)?c:(c==='teddy bear'?'dog':''));
 const IOS=/iPhone|iPad|iPod/.test(navigator.userAgent)||(navigator.platform==='MacIntel'&&navigator.maxTouchPoints>1);
 const ANDROID_CHROME=/Android/.test(navigator.userAgent)&&/Chrome\/\d/.test(navigator.userAgent)&&!/EdgA|SamsungBrowser|MiuiBrowser|OPR|YaBrowser|UCBrowser/.test(navigator.userAgent);
@@ -96,17 +123,32 @@ const cctx=clean.getContext('2d',{willReadFrequently:true});
 
 let stream=null,facing='environment',mode='person',running=false;
 let detectors=[],kind='';
-const POOL=Math.max(1,Math.min(3,parseInt(new URLSearchParams(location.search).get('workers'))||((IOS||((navigator.hardwareConcurrency||2)>=4&&(navigator.deviceMemory||8)>=4))?2:1)));
-let lastTs=0,inferMs=0,cleanTs=0,ageMs=0,detN=0,detRate=0,detT=0;
+const POOL=Math.max(1,Math.min(3,parseInt(PARAMS.get('workers'))||((THREADS>1||IOS)?1:(((navigator.hardwareConcurrency||2)>=4&&(navigator.deviceMemory||8)>=4)?2:1))));
+let threads=1;
+let lastTs=0,inferMs=0,cleanTs=0,ageMs=0,detN=0,detRate=0,detT=0,camN=0,camFps=0,recN=0,recFps=0;
+let frameWaiters=[],lastClaimTs=0,lastClaimAt=0;
+function nextFrame(){return new Promise(r=>{if(frameWaiters.length>32)frameWaiters.shift()();frameWaiters.push(r);});}
+async function claimFrame(det){
+  for(;;){
+    if(!running)return false;
+    const now=performance.now();
+    const n=detectors.length||1;
+    const stagger=n>1&&inferMs?inferMs/n-(now-lastClaimAt):0;
+    const rest=PACE&&inferMs&&fps>0?(fps<30?inferMs*0.75:fps<45?inferMs*0.35:0)-(now-(det.doneAt||0)):0;
+    const wait=Math.max(stagger,rest);
+    if(wait>0){await sleep(Math.min(wait,50));continue;}
+    if(cleanTs<=lastClaimTs){await Promise.race([nextFrame(),sleep(100)]);continue;}
+    lastClaimTs=cleanTs;lastClaimAt=performance.now();return true;
+  }
+}
 let fps=0,fpsN=0,fpsT=0,lastFrame=0,lastStep=0,newFrame=true,lastVF=0,vfc=false,cntText='',perfText='';
-function armVF(){if(vfc||typeof video.requestVideoFrameCallback!=='function')return;vfc=true;video.requestVideoFrameCallback(()=>{vfc=false;newFrame=true;armVF();});}
+function armVF(){if(vfc||typeof video.requestVideoFrameCallback!=='function')return;vfc=true;video.requestVideoFrameCallback(()=>{vfc=false;newFrame=true;camN++;armVF();});}
 let toastTimer=null,diagT=0;
 const DIAG=new URLSearchParams(location.search).has('diag');
 let glInfo='';
 try{const g=document.createElement('canvas').getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');glInfo=e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'';}catch(e){}
 function diagText(now){
-  if(now-detT>=1000){detRate=detN*1000/(now-detT);detN=0;detT=now;}
-  return 'UA: '+navigator.userAgent.slice(0,90)+'\nядра: '+(navigator.hardwareConcurrency||'?')+'  память: '+(navigator.deviceMemory||'?')+' ГБ  GPU: '+(glInfo||'?')+'  WebGPU: '+(navigator.gpu?'да':'нет')+'\nрежим: '+LABEL[kind]+'×'+detectors.length+' модель '+MODELS[MKEY].name+' вход '+SIZE+'  видео '+video.videoWidth+'×'+video.videoHeight+'\nинференс '+Math.round(inferMs)+' мс  детекций/с '+detRate.toFixed(1)+'  возраст кадра при результате '+Math.round(ageMs)+' мс\nFPS '+Math.round(fps)+'  треков '+tracker.tracks.length;
+  return 'UA: '+navigator.userAgent.slice(0,90)+'\nядра: '+(navigator.hardwareConcurrency||'?')+'  память: '+(navigator.deviceMemory||'?')+' ГБ  GPU: '+(glInfo||'?')+'  WebGPU: '+(navigator.gpu?'да':'нет')+'\nрежим: '+LABEL[kind]+'×'+detectors.length+' потоков '+threads+' изоляция '+(ISO?'да':'нет')+' модель '+MODELS[MKEY].name+' вход '+inputDims(MKEY,clean.width,clean.height).join('×')+'  видео '+video.videoWidth+'×'+video.videoHeight+'\nинференс '+Math.round(inferMs)+' мс  детекций/с '+detRate.toFixed(1)+'  возраст кадра при результате '+Math.round(ageMs)+' мс\nFPS экрана '+Math.round(fps)+'  камеры '+Math.round(camFps)+'  записи '+Math.round(recFps)+'  треков '+tracker.tracks.length;
 }
 if(DIAG)diagEl.hidden=false;
 
@@ -130,91 +172,129 @@ function decode(out,names,thr,size){
   }
   return nms(dets,0.45);
 }
-function tensor(px,size){const n=size*size;const f=new Float32Array(3*n);for(let i=0,j=0;i<n;i++,j+=4){f[i]=px[j]/255;f[n+i]=px[j+1]/255;f[2*n+i]=px[j+2]/255;}return f;}`;
+function tensor(px,w,h){const n=w*h;const f=new Float32Array(3*n);for(let i=0,j=0;i<n;i++,j+=4){f[i]=px[j]/255;f[n+i]=px[j+1]/255;f[2*n+i]=px[j+2]/255;}return f;}`;
 
-const WORKER_SRC=`
-importScripts('${ORT}ort.webgpu.min.js');
+const workerSrc=lib=>`
+importScripts('${ORT}${lib}');
 ort.env.wasm.wasmPaths='${ORT}';
-ort.env.wasm.numThreads=1;
+ort.env.wasm.numThreads=${THREADS};
 ${YOLO_LIB}
-let session=null,names=null,size=0,input='';
+let session=null,names=null,size=0,input='',u8=true,cls=null,clsIn='';
+function sumRange(p,a,b){let s=0;for(let i=a;i<=b;i++)s+=p[i];return s;}
 self.onmessage=async e=>{
   const m=e.data;
   if(m.type==='init'){
     try{
-      names=m.names;size=m.size;
+      names=m.names;size=m.size;u8=true;
+      if(m.eps[0]==='webgpu'&&!(self.navigator&&self.navigator.gpu))throw new Error('нет WebGPU в воркере');
       session=await ort.InferenceSession.create(m.model,{executionProviders:m.eps});
       input=session.inputNames[0];
-      self.postMessage({type:'ready'});
+      if(m.cls){try{cls=await ort.InferenceSession.create(m.cls,{executionProviders:m.eps});clsIn=cls.inputNames[0];}catch(e2){cls=null;}}
+      self.postMessage({type:'ready',threads:ort.env.wasm.numThreads,cls:!!cls});
     }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
+    return;
+  }
+  if(m.type==='verify'){
+    try{
+      const o=await cls.run({[clsIn]:new ort.Tensor('uint8',new Uint8Array(m.buf),[1,224,224,4])});
+      const p=o[Object.keys(o)[0]].data;
+      let top=0;for(let i=1;i<p.length;i++)if(p[i]>p[top])top=i;
+      const R=${JSON.stringify([[7,24],[80,100],[127,146],[151,299],[339,353],[385,386],[850,850]])};
+      let animal=0;for(const [a,b] of R)animal+=sumRange(p,a,b);
+      self.postMessage({type:'verified',id:m.id,tid:m.tid,animal,dog:sumRange(p,151,268),cat:sumRange(p,281,285),top,topP:p[top],topAnimal:R.some(([a,b])=>top>=a&&top<=b)});
+    }catch(err){self.postMessage({type:'verified',id:m.id,tid:m.tid,error:String(err&&err.message||err)});}
     return;
   }
   if(m.type==='frame'){
     try{
       const t0=performance.now();
-      const out=await session.run({[input]:new ort.Tensor('float32',tensor(new Uint8ClampedArray(m.buf),size),[1,3,size,size])});
+      let out;
+      if(u8){try{out=await session.run({[input]:new ort.Tensor('uint8',new Uint8Array(m.buf),[1,m.h,m.w,4])});}catch(e1){u8=false;}}
+      if(!u8)out=await session.run({[input]:new ort.Tensor('float32',tensor(new Uint8ClampedArray(m.buf),m.w,m.h),[1,3,m.h,m.w])});
       self.postMessage({type:'result',dets:decode(out,names,${KEEP_SCORE},size),ms:performance.now()-t0});
     }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
   }
 };`;
 
-function workerDetector(eps,mk){
+function workerDetector(eps,mk,lib){
   const size=MODELS[mk].size;
   return new Promise((resolve,reject)=>{
-    const url=URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'}));
+    const url=URL.createObjectURL(new Blob([workerSrc(lib)],{type:'text/javascript'}));
     let w;
     try{w=new Worker(url);}catch(e){reject(e);return;}
     let pending=null,ready=false;
-    const fail=err=>{w.terminate();if(pending){const p=pending;pending=null;p.reject(err);}if(!ready)reject(err);};
+    const vjobs=new Map();
+    const fail=err=>{w.terminate();if(pending){const p=pending;pending=null;p.reject(err);}for(const j of vjobs.values())j.reject(err);vjobs.clear();if(!ready)reject(err);};
     const timer=setTimeout(()=>fail(new Error('время ожидания вышло')),180000);
     w.onerror=ev=>{clearTimeout(timer);fail(new Error(ev.message||'ошибка воркера'));};
     w.onmessage=ev=>{
       const m=ev.data;
       if(m.type==='ready'){
-        clearTimeout(timer);ready=true;
+        clearTimeout(timer);ready=true;threads=m.threads||1;
         resolve({
-          detect(img,ts){return new Promise((res,rej)=>{pending={resolve:res,reject:rej};w.postMessage({type:'frame',buf:img.data.buffer,ts},[img.data.buffer]);});},
+          cls:!!m.cls,
+          detect(g,ts){return new Promise((res,rej)=>{pending={resolve:res,reject:rej};w.postMessage({type:'frame',buf:g.img.data.buffer,w:g.iw,h:g.ih,ts},[g.img.data.buffer]);});},
+          verify(img,tid){return new Promise((res,rej)=>{const id=++verifyId;vjobs.set(id,{resolve:res,reject:rej});w.postMessage({type:'verify',buf:img.data.buffer,id,tid},[img.data.buffer]);});},
           close(){w.terminate();}
         });
+      }else if(m.type==='verified'){
+        const j=vjobs.get(m.id);if(j){vjobs.delete(m.id);if(m.error)j.reject(new Error(m.error));else j.resolve(m);}
       }else if(m.type==='result'){
         if(pending){const p=pending;pending=null;p.resolve(m);}
       }else if(m.type==='error'){
         clearTimeout(timer);fail(new Error(m.message));
       }
     };
-    w.postMessage({type:'init',model:modelUrl(mk),eps,names:WANT,size});
+    w.postMessage({type:'init',model:modelUrl(mk),cls:VERIFY_ON?new URL('model_cls224.onnx',location.href).href:'',eps,names:WANT,size});
   });
 }
 
-async function mainDetector(mk){
+async function mainDetector(mk,eps){
   const size=MODELS[mk].size;
-  const ort=await import(ORT+'ort.min.mjs');
+  if(eps[0]==='webgpu'&&!navigator.gpu)throw new Error('нет WebGPU');
+  const ort=await import(ORT+(eps[0]==='webgpu'?'ort.webgpu.min.mjs':'ort.wasm.min.mjs'));
   ort.env.wasm.wasmPaths=ORT;
-  ort.env.wasm.numThreads=1;
+  ort.env.wasm.numThreads=THREADS;
   const lib=new Function(YOLO_LIB+';return {decode,tensor};')();
-  const session=await ort.InferenceSession.create(modelUrl(mk),{executionProviders:['wasm']});
+  const session=await ort.InferenceSession.create(modelUrl(mk),{executionProviders:eps});
+  threads=ort.env.wasm.numThreads;
   const input=session.inputNames[0];
+  let u8=true,cls=null;
+  if(VERIFY_ON){try{cls=await ort.InferenceSession.create(new URL('model_cls224.onnx',location.href).href,{executionProviders:eps});}catch(e){cls=null;}}
+  const sumR=(p,a,b)=>{let s=0;for(let i=a;i<=b;i++)s+=p[i];return s;};
   return {
-    async detect(img){
+    cls:!!cls,
+    async verify(img,tid){
+      const o=await cls.run({[cls.inputNames[0]]:new ort.Tensor('uint8',new Uint8Array(img.data.buffer),[1,224,224,4])});
+      const p=o[Object.keys(o)[0]].data;
+      let top=0;for(let i=1;i<p.length;i++)if(p[i]>p[top])top=i;
+      let animal=0;for(const [a,b] of ANIMAL_IDX)animal+=sumR(p,a,b);
+      return {tid,animal,dog:sumR(p,DOG_IDX[0],DOG_IDX[1]),cat:sumR(p,CAT_IDX[0],CAT_IDX[1]),top,topP:p[top],topAnimal:ANIMAL_IDX.some(([a,b])=>top>=a&&top<=b)};
+    },
+    async detect(g){
       const t0=performance.now();
-      const out=await session.run({[input]:new ort.Tensor('float32',lib.tensor(img.data,size),[1,3,size,size])});
+      let out;
+      if(u8){try{out=await session.run({[input]:new ort.Tensor('uint8',new Uint8Array(g.img.data.buffer),[1,g.ih,g.iw,4])});}catch(e1){u8=false;}}
+      if(!u8)out=await session.run({[input]:new ort.Tensor('float32',lib.tensor(g.img.data,g.iw,g.ih),[1,3,g.ih,g.iw])});
       return {dets:lib.decode(out,WANT,KEEP_SCORE,size),ms:performance.now()-t0};
     },
     close(){session.release();}
   };
 }
 
-const KINDS={wgpu:s=>workerDetector(['webgpu'],s),wcpu:s=>workerDetector(['wasm'],s),main:s=>mainDetector(s)};
+const KINDS={wgpu:s=>workerDetector(['webgpu'],s,'ort.webgpu.min.js'),mgpu:s=>mainDetector(s,['webgpu']),wcpu:s=>workerDetector(['wasm'],s,'ort.wasm.min.js'),main:s=>mainDetector(s,['wasm'])};
 
 function withTimeout(p,ms){return Promise.race([p,new Promise((_,rej)=>setTimeout(()=>rej(new Error('время ожидания вышло')),ms))]);}
 
 async function videoReady(){while(!(video.readyState>=2&&video.videoWidth))await sleep(50);}
 
+const CALIB_SIM=(PARAMS.get('calibsim')||'').split(',').filter(Boolean).map(Number);
 async function measure(d){
   await videoReady();
-  for(let i=0;i<2;i++)await withTimeout(d.detect(grabFrame().img,nextTs()),30000);
+  if(CALIB_SIM.length){await withTimeout(d.detect(grabFrame(),nextTs()),30000);return CALIB_SIM.shift();}
+  for(let i=0;i<2;i++)await withTimeout(d.detect(grabFrame(),nextTs()),30000);
   const t=[];
-  for(let i=0;i<3;i++){const t0=performance.now();await withTimeout(d.detect(grabFrame().img,nextTs()),20000);t.push(performance.now()-t0);}
+  for(let i=0;i<3;i++){const t0=performance.now();await withTimeout(d.detect(grabFrame(),nextTs()),20000);t.push(performance.now()-t0);}
   t.sort((a,b)=>a-b);
   return t[1];
 }
@@ -223,21 +303,21 @@ async function createDetector(){
   const fake=new URLSearchParams(location.search).get('fakedet');
   if(fake!==null&&window.__fakeDets){
     kind='fake';
-    return {async detect(){await sleep(parseInt(fake)||250);return {dets:window.__fakeDets(clean,SIZE),ms:parseInt(fake)||250};},close(){}};
+    return fakeDetector(parseInt(fake)||250,0);
   }
   const params=new URLSearchParams(location.search);
   const forcedModel=MODELS[params.get('model')]?params.get('model'):'';
   const force=params.get('backend');
-  if(force&&KINDS[force]){kind=force;setModel(forcedModel||'n512');return KINDS[force](MKEY);}
+  if(force&&KINDS[force]){kind=force;setModel(forcedModel||'nrect');return KINDS[force](MKEY);}
   let saved=null;
   try{saved=JSON.parse(localStorage.getItem('backend')||'null');}catch(e){}
-  if(!forcedModel&&saved&&saved.ver===MVER&&KINDS[saved.kind]&&MODELS[saved.model]&&!(saved.kind==='wgpu'&&gpuTrial)){
+  if(!forcedModel&&saved&&saved.ver===MVER&&KINDS[saved.kind]&&MODELS[saved.model]&&!((saved.kind==='wgpu'||saved.kind==='mgpu')&&gpuTrial)){
     setModel(saved.model);
-    if(saved.kind==='wgpu')markGpu(true);
+    if(saved.kind==='wgpu'||saved.kind==='mgpu')markGpu(true);
     try{const d=await KINDS[saved.kind](MKEY);kind=saved.kind;return d;}catch(e){}
   }
-  setModel(forcedModel||'n512');
-  const tries=(navigator.gpu&&(params.has('gpu')||(ANDROID_CHROME&&!gpuTrial)))?['wgpu','wcpu']:['wcpu'];
+  setModel(forcedModel||'nrect');
+  const tries=(navigator.gpu&&(params.has('gpu')||!gpuTrial))?['wgpu','mgpu','wcpu']:['wcpu'];
   if(tries[0]==='wgpu')markGpu(true);
   toast('Подбираю режим работы…',0);
   let best=null;
@@ -250,12 +330,13 @@ async function createDetector(){
   }
   if(!best){const d=await KINDS.main(MKEY);kind='main';return d;}
   kind=best.kind;
-  if(!forcedModel&&best.ms<=FAST_MS){
+  if(!forcedModel&&best.ms<=SLOW_MS){
     const base={model:MKEY,d:best.d,ms:best.ms};
-    for(const cand of ['s512','n640']){
+    const cands=best.ms<=FAST_MS?['srect','s416','n640']:['s416'];
+    for(const cand of cands){
       let d2=null,ms2=Infinity;
       try{setModel(cand);d2=await KINDS[kind](cand);ms2=await measure(d2);}catch(e){if(d2)d2.close();d2=null;}
-      if(d2&&ms2<=(cand==='s512'?S_MS:SLOW_MS)){base.d.close();best={kind,d:d2,ms:ms2};break;}
+      if(d2&&ms2<=(cand[0]==='s'?S_MS:SLOW_MS)){base.d.close();best={kind,d:d2,ms:ms2};break;}
       if(d2)d2.close();
       setModel(base.model);
     }
@@ -274,8 +355,12 @@ async function fallbackDetector(){
   throw new Error('нейросеть недоступна');
 }
 
+function fakeDetector(base,jit){
+  return {async detect(){const ms=jit?base*(1-jit+2*jit*Math.random()):base;await sleep(ms);return {dets:window.__fakeDets(clean,SIZE),ms};},close(){}};
+}
 function addWorkers(){
-  if(kind==='main'||kind==='fake'||kind==='wgpu')return;
+  if(kind==='fake'){if(PARAMS.has('workers'))for(let i=detectors.length;i<POOL;i++){const d=fakeDetector(parseInt(PARAMS.get('fakedet'))||250,0.4);detectors.push(d);detectLoop(d);}return;}
+  if(kind==='main'||kind==='wgpu'||kind==='mgpu')return;
   for(let i=detectors.length;i<POOL;i++){
     KINDS[kind](MKEY).then(d=>{if(running&&detectors.length&&detectors.length<POOL){detectors.push(d);detectLoop(d);}else d.close();}).catch(()=>{});
   }
@@ -331,14 +416,15 @@ function focusRoi(vw,vh){
 }
 function grabFrame(focus){
   const vw=clean.width||2,vh=clean.height||2;
-  if(fc.width!==SIZE){fc.width=SIZE;fc.height=SIZE;fctx.imageSmoothingQuality='low';}
+  const [W,H]=inputDims(MKEY,vw,vh);
+  if(fc.width!==W||fc.height!==H){fc.width=W;fc.height=H;fctx.imageSmoothingQuality='low';}
   const roi=focus?focusRoi(vw,vh):{x:0,y:0,w:vw,h:vh};
-  const r=Math.min(SIZE/roi.w,SIZE/roi.h);
+  const r=Math.min(W/roi.w,H/roi.h);
   const nw=Math.round(roi.w*r),nh=Math.round(roi.h*r);
-  const px=Math.round((SIZE-nw)/2),py=Math.round((SIZE-nh)/2);
-  fctx.fillStyle='rgb(114,114,114)';fctx.fillRect(0,0,SIZE,SIZE);
+  const px=Math.round((W-nw)/2),py=Math.round((H-nh)/2);
+  fctx.fillStyle='rgb(114,114,114)';fctx.fillRect(0,0,W,H);
   fctx.drawImage(clean,roi.x,roi.y,roi.w,roi.h,px,py,nw,nh);
-  return {img:fctx.getImageData(0,0,SIZE,SIZE),r,px,py,vw:roi.w,vh:roi.h,ox:roi.x,oy:roi.y,focus:!!focus};
+  return {img:fctx.getImageData(0,0,W,H),iw:W,ih:H,r,px,py,vw:roi.w,vh:roi.h,ox:roi.x,oy:roi.y,focus:!!focus};
 }
 function unbox(d,g){
   let x=(d.box[0]-g.px)/g.r,y=(d.box[1]-g.py)/g.r,w=d.box[2]/g.r,h=d.box[3]/g.r;
@@ -349,7 +435,7 @@ function unbox(d,g){
 }
 
 function createTracker(o){
-  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,sureIn:0.6,ttlSmall:2000,hardMiss:3,handR:4,...o};
+  const P={low:0.15,high:0.4,fresh:0.45,freshAnimal:0.38,confirmAnimal:2,freshSmall:0.3,smallH:0.1,confirmSmall:2,lowIou:0.5,lowMax:3,show:0.3,sure:0.7,matchIou:0.25,ttl:800,ttlEst:1500,ttlStatic:2500,ttlAnimalMoving:1000,confirm:2,establish:2,contain:0.9,partIn:0.7,partAccept:4,crossIn:0.85,crossScore:0.45,tauFast:18,tauSlow:120,tauSize:180,dead:2,histMs:1200,replayMs:700,minStep:28,mergeIou:0.6,globalR:6,trackR:3,stale:400,sureIn:0.6,ttlSmall:2000,hardMiss:3,handR:4,qPoor:1.5,refPoor:0.9,refGood:0.45,coastMs:600,...o};
   const T={tracks:[],nextId:1,frames:[],w:0,h:0,scale:1,lastTs:0};
   const GROUP=o&&o.group?o.group:c=>c==='person'?'person':'animal';
 
@@ -391,7 +477,8 @@ function createTracker(o){
     if(x+bw>w-lim)bw=w-lim-x;
     if(y+bh>h-lim)bh=h-lim-y;
     if(bw<4||bh<4)return null;
-    if(texture(prev,w,x,y,bw,bh,st)<2.5)return null;
+    const tex=texture(prev,w,x,y,bw,bh,st);
+    if(tex<2.5)return null;
     const n=2*R+1,S=new Float64Array(n*n);
     let best=Infinity,bi=0,bj=0;
     for(let j=-R;j<=R;j++)for(let i=-R;i<=R;i++){
@@ -403,7 +490,7 @@ function createTracker(o){
     const c=(bj+R)*n+(bi+R);
     if(bi>-R&&bi<R)fx=sub(S[c-1],S[c],S[c+1]);
     if(bj>-R&&bj<R)fy=sub(S[c-n],S[c],S[c+n]);
-    return {dx:cx+bi+fx,dy:cy+bj+fy,sad:best};
+    return {dx:cx+bi+fx,dy:cy+bj+fy,sad:best,q:best/(Math.ceil(bw/st)*Math.ceil(bh/st))/tex};
   }
 
   function region(b){
@@ -414,6 +501,43 @@ function createTracker(o){
   }
 
   function radius(base,dt,cap){return Math.min(cap,Math.max(base,Math.ceil(base*dt/33)));}
+
+  function patchOf(b){
+    const s=T.scale;
+    let x=Math.round((b[0]+b[2]*0.2)/s),y=Math.round((b[1]+b[3]*0.1)/s),bw=Math.round(b[2]*0.6/s),bh=Math.round(b[3]*0.8/s);
+    if(x<1){bw-=1-x;x=1;}
+    if(y<1){bh-=1-y;y=1;}
+    if(x+bw>T.w-1)bw=T.w-1-x;
+    if(y+bh>T.h-1)bh=T.h-1-y;
+    if(bw<3||bh<3)return null;
+    const a=bw*bh;
+    return {x,y,bw,bh,st:a>6000?3:a>1500?2:1};
+  }
+  function capture(t,g){
+    const p=patchOf(t.pos);
+    if(!p){t.ref=null;return;}
+    const buf=new Uint8Array(Math.ceil(p.bw/p.st)*Math.ceil(p.bh/p.st));
+    let k=0,sum=0;
+    for(let j=0;j<p.bh;j+=p.st){const r=(p.y+j)*T.w+p.x;for(let i=0;i<p.bw;i+=p.st){const v=g[r+i];buf[k++]=v;sum+=v;}}
+    const m=sum/k;let d=0;
+    for(let i=0;i<k;i++)d+=Math.abs(buf[i]-m);
+    t.ref={g:buf,m,tex:Math.max(2.5,d/k),bw:p.bw,bh:p.bh,st:p.st};
+  }
+  function refQ(t,g){
+    const r=t.ref,p=patchOf(t.pos);
+    if(!r||!p||p.bw!==r.bw||p.bh!==r.bh||p.st!==r.st)return -1;
+    let best=Infinity;
+    for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+      const x=p.x+dx,y=p.y+dy;
+      if(x<0||y<0||x+p.bw>T.w||y+p.bh>T.h)continue;
+      let sum=0,k=0;
+      for(let j=0;j<p.bh;j+=p.st){const row=(y+j)*T.w+x;for(let i=0;i<p.bw;i+=p.st){sum+=g[row+i];k++;}}
+      const m=sum/k;let d=0;k=0;
+      for(let j=0;j<p.bh;j+=p.st){const row=(y+j)*T.w+x;for(let i=0;i<p.bw;i+=p.st){d+=Math.abs((g[row+i]-m)-(r.g[k]-r.m));k++;}}
+      if(d<best)best=d;
+    }
+    return best/r.g.length/r.tex;
+  }
 
   function half(g,w,h){
     const w2=w>>1,h2=h>>1,o=new Uint8Array(w2*h2);
@@ -444,7 +568,7 @@ function createTracker(o){
       if(m&&(!best||m.sad<best.sad))best=m;
     }
     const s=T.scale;
-    return best?[best.dx*s,best.dy*s]:[gdx*s,gdy*s];
+    return best?{dx:best.dx*s,dy:best.dy*s,q:best.q}:null;
   }
 
   function motionStep(gray,w,h,scale,now){
@@ -458,16 +582,36 @@ function createTracker(o){
       const prev2=T.frames[T.frames.length-2];
       for(const t of T.tracks){
         const lh=t.hist[t.hist.length-1];
-        let [dx,dy]=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
-        if(prev2&&lh&&lh.t===prev.t&&Math.hypot(dx,dy)<T.scale&&Math.hypot(lh.dx,lh.dy)<T.scale){
-          const b2=[t.pos[0]-lh.dx,t.pos[1]-lh.dy,t.pos[2],t.pos[3]];
-          const g2x=(prev.gdx||0)+(cur.gdx||0),g2y=(prev.gdy||0)+(cur.gdy||0);
-          const m2=step(prev2,cur,b2,g2x,g2y,(lh.dx+dx)/T.scale,(lh.dy+dy)/T.scale);
-          dx=m2[0]-lh.dx;dy=m2[1]-lh.dy;
-        }
-        t.pos[0]+=dx;t.pos[1]+=dy;
         const sd=Math.max(1,now-prev.t);
-        t.vel=[dx/sd,dy/sd];t.velT=now;
+        const m=step(prev,cur,t.pos,cur.gdx,cur.gdy,lh?lh.dx/T.scale:0,lh?lh.dy/T.scale:0);
+        let dx,dy,good=!!m&&m.q<P.qPoor;
+        if(good){
+          dx=m.dx;dy=m.dy;
+          if(prev2&&lh&&lh.t===prev.t&&Math.hypot(dx,dy)<T.scale&&Math.hypot(lh.dx,lh.dy)<T.scale){
+            const b2=[t.pos[0]-lh.dx,t.pos[1]-lh.dy,t.pos[2],t.pos[3]];
+            const g2x=(prev.gdx||0)+(cur.gdx||0),g2y=(prev.gdy||0)+(cur.gdy||0);
+            const m2=step(prev2,cur,b2,g2x,g2y,(lh.dx+dx)/T.scale,(lh.dy+dy)/T.scale);
+            if(m2&&m2.q<P.qPoor){dx=m2.dx-lh.dx;dy=m2.dy-lh.dy;}
+          }
+        }else if(t.gvel&&now-t.gvelT<P.coastMs){dx=t.gvel[0]*sd;dy=t.gvel[1]*sd;}
+        else{dx=cur.gdx*T.scale;dy=cur.gdy*T.scale;}
+        t.pos[0]+=dx;t.pos[1]+=dy;
+        const pb=[t.pos[0]+t.pos[2]*0.2,t.pos[1]+t.pos[3]*0.1,t.pos[2]*0.6,t.pos[3]*0.8];
+        const owned=!T.tracks.some(o=>o!==t&&inside(pb,o.pos)>0.5);
+        let rq=owned?0:1;
+        if(t.fresh||!t.ref){if(owned){capture(t,cur.g);t.rq=0;t.fresh=0;}}
+        else{
+          rq=refQ(t,cur.g);
+          if(rq<0){if(owned){capture(t,cur.g);rq=0;}else rq=1;}
+          else t.rq=t.rq*0.5+rq*0.5;
+        }
+        if(rq>P.refPoor&&(!good||!owned)){
+          t.pos[0]-=dx;t.pos[1]-=dy;
+          if(t.gvel&&now-t.gvelT<P.coastMs){dx=t.gvel[0]*sd;dy=t.gvel[1]*sd;}else{dx=cur.gdx*T.scale;dy=cur.gdy*T.scale;}
+          t.pos[0]+=dx;t.pos[1]+=dy;good=false;
+        }
+        t.vel=[dx/sd,dy/sd];t.velT=now;t.mq=m?m.q:1;
+        if(good&&owned&&rq<P.refGood){t.gvel=t.gvel&&now-t.gvelT<200?[t.gvel[0]*0.5+t.vel[0]*0.5,t.gvel[1]*0.5+t.vel[1]*0.5]:t.vel.slice();t.gvelT=now;}
         t.hist.push({t:now,dx,dy});
         while(t.hist.length&&t.hist[0].t<now-P.histMs)t.hist.shift();
       }
@@ -485,7 +629,8 @@ function createTracker(o){
     const b=box.slice();
     let vx=0,vy=0;
     for(;i+1<f.length;i++){
-      const [dx,dy]=step(f[i],f[i+1],b,f[i+1].gdx,f[i+1].gdy,vx,vy);
+      const m=step(f[i],f[i+1],b,f[i+1].gdx,f[i+1].gdy,vx,vy);
+      const dx=m&&m.q<P.qPoor?m.dx:f[i+1].gdx*T.scale,dy=m&&m.q<P.qPoor?m.dy:f[i+1].gdy*T.scale;
       b[0]+=dx;b[1]+=dy;vx=dx/T.scale;vy=dy/T.scale;
     }
     return b;
@@ -529,8 +674,9 @@ function createTracker(o){
   function adopt(t,d,ts,now,weak){
     const nb=d.now||(d.now=replay(d.box,ts));
     const w=weak?0.45:0.7;
-    for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*(1-w)+nb[k]*w;
-    t.tDet=ts;if(!weak)t.hits++;t.miss=0;t.hard=0;t.lastSeen=now;t.part=0;
+    if(ts>=t.tDet)for(let k=0;k<4;k++)t.pos[k]=t.pos[k]*(1-w)+nb[k]*w;
+    t.tDet=Math.max(t.tDet,ts);if(!weak)t.hits++;t.miss=0;t.hard=0;t.lastSeen=now;t.part=0;
+    if(!weak)t.fresh=1;
     t.weakRun=weak?(t.weakRun||0)+1:0;
     t.score=weak?Math.max(t.score*0.92,d.score):t.score*0.6+d.score*0.4;
     t.peak=Math.max(t.peak,d.score);
@@ -615,6 +761,7 @@ function createTracker(o){
     for(let i=0;i<tr.length;i++)for(let j=tr.length-1;j>i;j--){
       const a=tr[i],b=tr[j];
       if(a.grp!==b.grp||iou(a.pos,b.pos)<P.mergeIou)continue;
+      if(a.hits>=P.establish&&b.hits>=P.establish&&now-a.lastSeen<700&&now-b.lastSeen<700)continue;
       const keep=(a.hits>=b.hits)?a:b,drop=keep===a?b:a;
       keep.score=Math.max(keep.score,drop.score);keep.peak=Math.max(keep.peak,drop.peak);
       tr.splice(tr.indexOf(drop),1);if(drop===a){i--;break;}
@@ -664,13 +811,14 @@ function createTracker(o){
   return {P,T,motionStep,update,smooth,visible,reset,match,step,get tracks(){return T.tracks;}};
 }
 const tracker=createTracker({});
-if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;}
+if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;window.__recStat=REC_STAT;}
 
 async function detectLoop(det){
   let cycle=0;
   const idx=detectors.indexOf(det);
   while(running&&detectors.includes(det)){
-    if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)||(recorder&&idx>0)){await sleep(50);continue;}
+    if(!(video.readyState>=2&&video.videoWidth&&clean.width>2)){await sleep(50);continue;}
+    if(!await claimFrame(det))return;
     cycle++;
     const vis=tracker.tracks.filter(visible);
     const hasSmall=tracker.tracks.some(t=>t.box[3]<0.15*clean.height&&(visible(t)||(t.small&&t.hits<2&&modeOk(t)))),hasLarge=vis.some(t=>t.box[3]>=0.3*clean.height);
@@ -678,13 +826,15 @@ async function detectLoop(det){
     const g=grabFrame(focus);
     const ts=cleanTs;
     try{
-      const r=await det.detect(g.img,ts);
+      const r=await det.detect(g,ts);
       const now=performance.now();
+      det.doneAt=now;
       inferMs=inferMs?inferMs*0.8+r.ms*0.2:r.ms;
       ageMs=ageMs?ageMs*0.8+(now-ts)*0.2:(now-ts);
       detN++;
       if(gpuPending)markGpu(false);
       tracker.update(r.dets.map(d=>unbox(d,g)).filter(d=>d&&d.box[2]>1&&d.box[3]>1),ts,now,g.focus?[g.ox,g.oy,g.vw,g.vh]:null);
+      verifyNext(det,now);
     }catch(e){
       const i=detectors.indexOf(det);
       if(i>=0)detectors.splice(i,1);
@@ -699,10 +849,56 @@ async function detectLoop(det){
 }
 
 function modeOk(t){return mode==='all'||(mode==='person')===(t.cls==='person');}
-function visible(t){return tracker.visible(t)&&modeOk(t);}
+function animalOk(t){
+  if(!verifyOk||t.grp==='person')return true;
+  if(t.verified===false)return false;
+  if(t.verified===true)return true;
+  return Math.min(t.pos[2],t.pos[3])<VERIFY_MIN||(t.verT||0)>0;
+}
+function visible(t){return tracker.visible(t)&&modeOk(t)&&animalOk(t);}
+function cropFor(t){
+  const vw=clean.width,vh=clean.height;
+  const b=t.pos,mw=b[2]*0.15,mh=b[3]*0.15;
+  const x1=Math.max(0,b[0]-mw),y1=Math.max(0,b[1]-mh),x2=Math.min(vw,b[0]+b[2]+mw),y2=Math.min(vh,b[1]+b[3]+mh);
+  const w=x2-x1,h=y2-y1;
+  if(w<8||h<8)return null;
+  const s=224/Math.min(w,h),dw=w*s,dh=h*s;
+  if(vc.width!==224){vc.width=224;vc.height=224;vctx.imageSmoothingQuality='medium';}
+  vctx.drawImage(clean,x1,y1,w,h,(224-dw)/2,(224-dh)/2,dw,dh);
+  const img=vctx.getImageData(0,0,224,224);
+  const d=img.data;let sum=0,n=0;
+  for(let i=0;i<d.length;i+=32){sum+=(d[i]*77+d[i+1]*150+d[i+2]*29)>>8;n++;}
+  img.luma=sum/n;
+  return img;
+}
+function verifyNext(det,now){
+  if(!det.cls||verifyBusy)return;
+  verifyOk=true;
+  let pick=null;
+  for(const t of tracker.tracks){
+    if(t.grp==='person'||!modeOk(t))continue;
+    if(Math.min(t.pos[2],t.pos[3])<VERIFY_MIN){if(t.verified===false)t.verified=undefined;continue;}
+    if(t.verified===undefined){pick=t;break;}
+    if(now-(t.verT||0)>2000&&(!pick||(t.verT||0)<(pick.verT||0)))pick=t;
+  }
+  if(!pick)return;
+  const img=cropFor(pick);
+  if(!img||img.luma<VERIFY_LUMA){pick.verT=now;if(pick.verified===false)pick.verified=undefined;return;}
+  verifyBusy=true;
+  det.verify(img,pick.id).then(r=>{
+    const t=tracker.tracks.find(x=>x.id===r.tid);
+    if(t){
+      t.verT=performance.now();t.animalP=r.animal;
+      t.verified=r.animal>=0.6||(r.topAnimal&&r.topP>=0.15);
+      if(t.verified&&(t.cls==='dog'||t.cls==='cat')&&Math.max(r.dog,r.cat)>=0.3)t.cls=r.cat>r.dog?'cat':'dog';
+    }
+  }).catch(()=>{}).finally(()=>{verifyBusy=false;});
+}
 
+function boxColor(t){return t.miss>1?'#ffcc33':(t.cls==='person'?'#39ff7a':'#3ad7ff');}
+function boxLabel(t){return labelOf(t)+' #'+t.id+'  '+Math.round(t.score*100)+'%';}
 function drawBox(ctx,x,y,w,h,t,s){
-  const color=t.miss>1?'#ffcc33':(t.cls==='person'?'#39ff7a':'#3ad7ff');
+  const color=boxColor(t);
   ctx.strokeStyle=color;
   ctx.globalAlpha=0.55;
   ctx.lineWidth=1.5*s;
@@ -717,7 +913,7 @@ function drawBox(ctx,x,y,w,h,t,s){
   ctx.moveTo(x+w,y+h-L);ctx.lineTo(x+w,y+h);ctx.lineTo(x+w-L,y+h);
   ctx.moveTo(x+L,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+h-L);
   ctx.stroke();
-  const label=labelOf(t)+' #'+t.id+'  '+Math.round(t.score*100)+'%';
+  const label=boxLabel(t);
   ctx.font='600 '+(14*s)+'px ui-monospace,Menlo,Consolas,monospace';
   const tw=ctx.measureText(label).width+12*s;
   const th=22*s;
@@ -745,6 +941,7 @@ function render(){
     cctx.drawImage(video,0,0,vw,vh);
     cleanTs=now;
     armVF();
+    if(frameWaiters.length){const ws=frameWaiters;frameWaiters=[];for(const r of ws)r();}
   }
   ctx.save();
   if(mirror){ctx.translate(vw,0);ctx.scale(-1,1);}
@@ -770,27 +967,32 @@ function render(){
     drawBox(ctx,x,y,w,h,t,S);
   }
   if(DIAG&&now-diagT>500){diagT=now;diagEl.textContent=diagText(now);}
-  if(recorder&&now-recFrameT>=recInt){recFrameT=now;feedRec(vw,vh,mirror,S);}
+  if(recorder&&now-recFrameT>=recInt){recFrameT=now;if(recMode==='worker')feedRecW(vw,vh,mirror,S);else feedRec(vw,vh,mirror,S);}
   fpsN++;
-  if(now-fpsT>=1000){fps=fpsN*1000/(now-fpsT);fpsN=0;fpsT=now;if(recorder)adaptRec();}
+  if(now-fpsT>=1000){const el=now-fpsT;fps=fpsN*1000/el;camFps=camN*1000/el;detRate=detN*1000/el;recFps=recorder?recN*1000/el:0;fpsN=camN=detN=recN=0;fpsT=now;if(recorder)adaptRec();}
   const ct=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
   if(ct!==cntText){cntText=ct;cnt.textContent=ct;}
-  const pt=Math.round(fps)+' FPS'+(detectors.length?' · '+Math.round(inferMs)+'мс · '+LABEL[kind]+(detectors.length>1?'×'+detectors.length:'')+'·'+MODELS[MKEY].name+SIZE:' · загрузка…');
+  const pt=Math.round(fps)+' FPS'+(detectors.length?' · '+Math.round(inferMs)+'мс · '+LABEL[kind]+(detectors.length>1?'×'+detectors.length:'')+'·'+MODELS[MKEY].name+(MODELS[MKEY].rect?'r':SIZE)+' · '+detRate.toFixed(1)+'/с'+(recorder?' · зап '+Math.round(recFps):''):' · загрузка…');
   if(pt!==perfText){perfText=pt;perf.textContent=pt;}
 }
 function feedRec(vw,vh,mirror,S){
   const rs=rc.width/vw;
+  const a=performance.now();
   rctx.save();
   if(mirror){rctx.translate(rc.width,0);rctx.scale(-1,1);}
   rctx.drawImage(clean,0,0,vw,vh,0,0,rc.width,rc.height);
   rctx.restore();
+  const b=performance.now();
   for(const t of tracker.tracks){
     if(!visible(t))continue;
     let [x,y,w,h]=t.box;
     if(mirror)x=vw-x-w;
     drawBox(rctx,x*rs,y*rs,w*rs,h*rs,t,S*rs);
   }
+  const c=performance.now();
   if(recTrack)recTrack.requestFrame();
+  if(REC_STAT){REC_STAT.push([b-a,c-b,performance.now()-c]);if(REC_STAT.length>2000)REC_STAT.shift();}
+  recN++;
 }
 function adaptRec(){
   const base=REC[recLevel].int;
@@ -866,6 +1068,106 @@ shot.addEventListener('click',()=>{
 });
 
 let recorder=null,recChunks=[],recStream=null,recStart=0,recTick=null,pendingFile=null,stopping=false,recTrack=null,recFrameT=0;
+let recW=null,recWReady=false,recInFlight=0,recMode='',recCodec=null;
+const MUX='https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js';
+const REC_SRC=`
+importScripts('${MUX}');
+let enc=null,mux=null,target=null,cv=null,cx=null,n=0,W=0,H=0,mirror=false;
+function drawBox(x,y,w,h,color,label,s){
+  cx.strokeStyle=color;cx.globalAlpha=0.55;cx.lineWidth=1.5*s;cx.strokeRect(x,y,w,h);cx.globalAlpha=1;
+  const L=Math.min(w,h)*0.22;cx.lineWidth=4*s;cx.lineCap='square';cx.beginPath();
+  cx.moveTo(x,y+L);cx.lineTo(x,y);cx.lineTo(x+L,y);cx.moveTo(x+w-L,y);cx.lineTo(x+w,y);cx.lineTo(x+w,y+L);
+  cx.moveTo(x+w,y+h-L);cx.lineTo(x+w,y+h);cx.lineTo(x+w-L,y+h);cx.moveTo(x+L,y+h);cx.lineTo(x,y+h);cx.lineTo(x,y+h-L);cx.stroke();
+  cx.font='600 '+(14*s)+'px ui-monospace,Menlo,Consolas,monospace';
+  const tw=cx.measureText(label).width+12*s,th=22*s,ly=y-th-4*s<0?y+4*s:y-th-4*s;
+  cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(x,ly,tw,th);cx.fillStyle=color;cx.textBaseline='middle';cx.fillText(label,x+6*s,ly+th/2);
+}
+self.onmessage=async e=>{
+  const m=e.data;
+  if(m.type==='init'){
+    try{
+      W=m.w;H=m.h;mirror=m.mirror;cv=new OffscreenCanvas(W,H);cx=cv.getContext('2d');
+      target=new Mp4Muxer.ArrayBufferTarget();
+      mux=new Mp4Muxer.Muxer({target,video:{codec:'avc',width:W,height:H},fastStart:'in-memory',firstTimestampBehavior:'offset'});
+      enc=new VideoEncoder({output:(c,meta)=>mux.addVideoChunk(c,meta),error:err=>self.postMessage({type:'error',message:String(err&&err.message||err)})});
+      enc.configure({codec:m.codec,width:W,height:H,bitrate:m.bps,framerate:m.fps,latencyMode:'realtime',avc:{format:'avc'}});
+      n=0;self.postMessage({type:'ready'});
+    }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
+    return;
+  }
+  if(m.type==='frame'){
+    try{
+      const b=m.bmp;
+      if(enc.encodeQueueSize>4){b.close();return;}
+      cx.save();if(mirror){cx.translate(W,0);cx.scale(-1,1);}cx.drawImage(b,0,0,W,H);cx.restore();b.close();
+      for(const q of m.boxes)drawBox(q.x,q.y,q.w,q.h,q.color,q.label,q.s);
+      const f=new VideoFrame(cv,{timestamp:Math.round(m.ts*1000)});
+      enc.encode(f,{keyFrame:n%60===0});f.close();n++;
+    }catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
+    return;
+  }
+  if(m.type==='stop'){
+    try{await enc.flush();enc.close();mux.finalize();const buf=target.buffer;self.postMessage({type:'done',buf,frames:n},[buf]);}
+    catch(err){self.postMessage({type:'error',message:String(err&&err.message||err)});}
+  }
+};`;
+async function probeRecCodec(){
+  if(typeof VideoEncoder==='undefined'||typeof OffscreenCanvas==='undefined'||typeof createImageBitmap==='undefined'||PARAMS.get('recw')!=='1')return false;
+  for(const codec of ['avc1.42E01E','avc1.4D401F','avc1.640028']){
+    try{const r=await VideoEncoder.isConfigSupported({codec,width:720,height:1280,bitrate:3000000,framerate:30});if(r&&r.supported)return codec;}catch(e){}
+  }
+  return false;
+}
+function finishRec(blob,type){
+  if(recStream){recStream.getTracks().forEach(t=>t.stop());recStream=null;}
+  if(recW){recW.terminate();recW=null;}
+  recWReady=false;recInFlight=0;recMode='';
+  recorder=null;recTrack=null;stopping=false;recChunks=[];
+  clearInterval(recTick);
+  record.classList.remove('live');record.textContent='Запись';record.disabled=false;rec.hidden=true;flip.disabled=false;
+  const sec=Math.round((performance.now()-recStart)/1000);
+  if(!blob||blob.size<2000||sec<1){toast('Видео не записалось');return;}
+  pendingFile=new File([blob],'detect_'+stamp()+'.'+(type.includes('mp4')?'mp4':'webm'),{type});
+  saveMsg.textContent='Видео '+pad(Math.floor(sec/60))+':'+pad(sec%60)+' · '+(blob.size/1048576).toFixed(1)+' МБ';
+  save.hidden=false;
+}
+function feedRecW(vw,vh,mirror,S){
+  if(!recWReady||recInFlight>=2)return;
+  const rs=rc.width/vw;
+  const boxes=[];
+  for(const t of tracker.tracks){
+    if(!visible(t))continue;
+    let [x,y,w,h]=t.box;
+    if(mirror)x=vw-x-w;
+    boxes.push({x:x*rs,y:y*rs,w:w*rs,h:h*rs,color:boxColor(t),label:boxLabel(t),s:S*rs});
+  }
+  const ts=performance.now()-recStart;
+  const a=performance.now();
+  recInFlight++;
+  createImageBitmap(clean,{resizeWidth:rc.width,resizeHeight:rc.height,resizeQuality:'low'}).catch(()=>createImageBitmap(clean)).then(bmp=>{
+    recInFlight--;
+    if(!recW||recMode!=='worker'){bmp.close();return;}
+    recW.postMessage({type:'frame',bmp,boxes,ts},[bmp]);recN++;
+  }).catch(()=>{recInFlight--;});
+  if(REC_STAT){REC_STAT.push([performance.now()-a,0,0]);if(REC_STAT.length>2000)REC_STAT.shift();}
+}
+function startRecWorker(){
+  const L=REC[recLevel];
+  const rs=Math.min(1,L.px/Math.max(canvas.width,canvas.height));
+  rc.width=Math.round(canvas.width*rs/2)*2;rc.height=Math.round(canvas.height*rs/2)*2;
+  recInt=L.int;recSlow=0;recFast=0;recFrameT=0;
+  recW=new Worker(URL.createObjectURL(new Blob([REC_SRC],{type:'text/javascript'})));
+  recW.onmessage=e=>{
+    const m=e.data;
+    if(m.type==='ready')recWReady=true;
+    else if(m.type==='done')finishRec(new Blob([m.buf],{type:'video/mp4'}),'video/mp4');
+    else if(m.type==='error'){recCodec=false;if(recorder){toast('Ошибка записи');finishRec(null,'');}}
+  };
+  recW.onerror=()=>{recCodec=false;if(recorder){toast('Ошибка записи');finishRec(null,'');}};
+  recW.postMessage({type:'init',w:rc.width,h:rc.height,mirror:facing==='user',codec:recCodec,bps:L.bps,fps:Math.round(1000/recInt)});
+  recMode='worker';
+  recorder={state:'recording',mimeType:'video/mp4',stop(){this.state='inactive';if(recW)recW.postMessage({type:'stop'});},onstop(){}};
+}
 const REC=[{px:720,int:50,bps:3000000},{px:540,int:67,bps:2000000},{px:404,int:83,bps:1200000}];
 let recInt=50,recLevel=0,recSlow=0,recFast=0;
 try{recLevel=Math.min(REC.length-1,Math.max(0,parseInt(localStorage.getItem('recLevel'))||0));}catch(e){}
@@ -878,9 +1180,19 @@ function pickMime(){
 }
 function hideSave(){save.hidden=true;pendingFile=null;}
 function startRec(){
+  hideSave();
+  if(recCodec){
+    try{startRecWorker();}catch(e){recCodec=false;recW=null;recMode='';}
+    if(recMode==='worker'){
+      recStart=performance.now();
+      recT.textContent='00:00';
+      record.classList.add('live');record.textContent='Стоп';rec.hidden=false;flip.disabled=true;
+      recTick=setInterval(()=>{const s=Math.floor((performance.now()-recStart)/1000);recT.textContent=pad(Math.floor(s/60))+':'+pad(s%60);},250);
+      return;
+    }
+  }
   const mime=pickMime();
   if(mime===null||!rc.captureStream){toast('Этот браузер не умеет записывать видео');return;}
-  hideSave();
   try{
     const L=REC[recLevel];
     const rs=Math.min(1,L.px/Math.max(canvas.width,canvas.height));
@@ -903,18 +1215,9 @@ function startRec(){
   recorder.onerror=()=>{if(recorder&&recorder.state!=='inactive'){toast('Ошибка записи');stopRec();}};
   recorder.onstop=()=>{
     const type=(recorder.mimeType||mime||'video/webm').split(';')[0];
-    const blob=new Blob(recChunks,{type});
-    recChunks=[];
-    recStream.getTracks().forEach(t=>t.stop());recStream=null;recorder=null;recTrack=null;stopping=false;
-    clearInterval(recTick);
-    record.classList.remove('live');record.textContent='Запись';record.disabled=false;rec.hidden=true;flip.disabled=false;
-    const sec=Math.round((performance.now()-recStart)/1000);
-    if(blob.size<2000||sec<1){toast('Видео не записалось');return;}
-    pendingFile=new File([blob],'detect_'+stamp()+'.'+(type.includes('mp4')?'mp4':'webm'),{type});
-    saveMsg.textContent='Видео '+pad(Math.floor(sec/60))+':'+pad(sec%60)+' · '+(blob.size/1048576).toFixed(1)+' МБ';
-    save.hidden=false;
+    finishRec(new Blob(recChunks,{type}),type);
   };
-  recorder.start();
+  if(!PARAMS.has('recprobe'))recorder.start();
   recStart=performance.now();
   recT.textContent='00:00';
   record.classList.add('live');record.textContent='Стоп';rec.hidden=false;flip.disabled=true;
@@ -923,7 +1226,7 @@ function startRec(){
 function stopRec(){
   if(!recorder||recorder.state==='inactive'||stopping)return;
   stopping=true;record.disabled=true;
-  setTimeout(()=>{if(recorder&&recorder.state!=='inactive')recorder.stop();},300);
+  setTimeout(()=>{if(recorder&&recorder.state!=='inactive')recorder.stop();else if(recorder)recorder.onstop();},300);
 }
 record.addEventListener('click',()=>{if(recorder)stopRec();else startRec();});
 saveBtn.addEventListener('click',async()=>{
@@ -951,7 +1254,7 @@ go.addEventListener('click',async()=>{
     msg.textContent='Браузер не даёт доступ к камере. Страницу нужно открыть по адресу https://';
     return;
   }
-  go.disabled=true;
+  go.disabled=true;started=true;
   try{
     msg.textContent='Включаю камеру…';
     await openCamera();
@@ -962,6 +1265,7 @@ go.addEventListener('click',async()=>{
   }
   startScreen.hidden=true;top.hidden=false;bar.hidden=false;
   running=true;lastFrame=fpsT=performance.now();
+  probeRecCodec().then(c=>{recCodec=c;}).catch(()=>{recCodec=false;});
   keepAwake();
   render();
   toast('Загружаю нейросеть…',0);
@@ -972,6 +1276,7 @@ go.addEventListener('click',async()=>{
     detectLoop(d);
     addWorkers();
   }catch(e){
+    if(ISO){await dropSw();location.reload();return;}
     toast('Не удалось загрузить нейросеть: '+errText(e)+'. Проверьте интернет и откройте страницу заново.',0);
   }
 });
