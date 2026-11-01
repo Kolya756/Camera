@@ -133,6 +133,19 @@ def private_ips():
     return found
 
 
+def free_port(ports):
+    for port in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("0.0.0.0", port))
+            return port
+        except OSError:
+            continue
+        finally:
+            s.close()
+    return None
+
+
 def host_name():
     h = socket.gethostname().strip().lower()
     return h if re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", h or "") else ""
@@ -356,21 +369,29 @@ async def serve(det, folder, ips):
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(folder / "leaf.pem", folder / "leaf.key")
     runners = []
-    for app, port, tls in ((secure, HTTPS_PORT, ctx), (plain, HTTP_PORT, None)):
-        r = web.AppRunner(app, access_log=None)
-        await r.setup()
-        try:
-            await web.TCPSite(r, "0.0.0.0", port, ssl_context=tls, shutdown_timeout=1.0).start()
-        except OSError as e:
-            say(f"Порт {port} занят ({e}). Закройте другое окно сервера и запустите снова.")
-            raise SystemExit(1)
-        runners.append(r)
+    r = web.AppRunner(secure, access_log=None)
+    await r.setup()
+    runners.append(r)
+    try:
+        await web.TCPSite(r, "0.0.0.0", HTTPS_PORT, ssl_context=ctx, shutdown_timeout=1.0).start()
+    except OSError as e:
+        say(f"Порт {HTTPS_PORT} занят ({e}). Скорее всего сервер уже открыт в другом окне: закройте его и запустите снова.")
+        raise SystemExit(1)
+    http_port = free_port((HTTP_PORT, 8001, 8080, 8081, 8888))
+    if http_port:
+        r2 = web.AppRunner(plain, access_log=None)
+        await r2.setup()
+        runners.append(r2)
+        await web.TCPSite(r2, "0.0.0.0", http_port, shutdown_timeout=1.0).start()
     ip = ips[0] if ips else "127.0.0.1"
     line = "=" * 66
     say(line)
     say("  БОКСЫ: сервер готов")
     say(f"  {det.device_name} · {det.name}" + (" · fp16" if det.half else " · процессор"))
-    say(f"  Первый раз на iPhone откройте в Safari:  http://{ip}:{HTTP_PORT}")
+    if http_port:
+        say(f"  Первый раз на iPhone откройте в Safari:  http://{ip}:{http_port}")
+    else:
+        say(f"  Первый раз на iPhone откройте в Safari:  https://{ip}:{HTTPS_PORT}/setup")
     say(f"  Камера:                                  https://{ip}:{HTTPS_PORT}")
     for other in ips[1:]:
         say(f"  другой адрес этого ПК:                   https://{other}:{HTTPS_PORT}")
