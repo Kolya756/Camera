@@ -7,7 +7,7 @@ $UvDir = Join-Path $Root 'uv'
 $Uv = Join-Path $UvDir 'uv.exe'
 $Venv = Join-Path $Root 'venv'
 $Py = Join-Path $Venv 'Scripts\python.exe'
-$Ready = Join-Path $Root 'ready-1.txt'
+$Ready = Join-Path $Root 'ready-2.txt'
 $Fw = Join-Path $Root 'firewall-1.txt'
 $env:UV_CACHE_DIR = Join-Path $Root 'cache'
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $Root 'python'
@@ -50,7 +50,7 @@ try {
             if (Test-Path $Venv) { Remove-Item $Venv -Recurse -Force }
             Run $Uv @('venv', $Venv, '--python', '3.13') 'не удалось создать окружение Python'
         }
-        Run $Uv @('pip', 'install', '--python', $Py, 'torch', 'torchvision', 'ultralytics', 'aiohttp', 'cryptography', '--torch-backend=auto') 'не удалось установить пакеты'
+        Run $Uv @('pip', 'install', '--python', $Py, 'torch', 'torchvision', 'ultralytics', 'lap', 'aiohttp', 'cryptography', '--torch-backend=auto') 'не удалось установить пакеты'
         if (-not (GpuOk)) {
             Say 'Видеокарта не ответила, ставлю PyTorch для CUDA 12.8...'
             Run $Uv @('pip', 'install', '--python', $Py, '--reinstall-package', 'torch', '--reinstall-package', 'torchvision', 'torch', 'torchvision', '--torch-backend=cu128') 'не удалось установить PyTorch'

@@ -163,7 +163,7 @@ const DIAG=new URLSearchParams(location.search).has('diag');
 let glInfo='';
 try{const g=document.createElement('canvas').getContext('webgl');const e=g&&g.getExtension('WEBGL_debug_renderer_info');glInfo=e?g.getParameter(e.UNMASKED_RENDERER_WEBGL):'';}catch(e){}
 function diagText(now){
-  if(kind==='pc')return 'UA: '+navigator.userAgent.slice(0,90)+'\nрежим: ПК '+(pc.info?pc.info.device+' · '+pc.info.model+(pc.info.half?' fp16':''):'-')+'  связь '+(pc.up?'есть':'нет')+'  кадр '+pcDims(clean.width,clean.height).join('×')+' '+Math.round(pc.kb)+' КБ  видео '+video.videoWidth+'×'+video.videoHeight+'\nзадержка рамок '+Math.round(ageMs)+' мс  туда-обратно '+Math.round(pc.rtt)+' мс  на ПК '+Math.round(pc.srv)+' мс  сжатие '+Math.round(pc.enc)+' мс  потеряно '+pc.lost+'\nдетекций/с '+detRate.toFixed(1)+'  FPS экрана '+Math.round(fps)+'  камеры '+Math.round(camFps)+'  записи '+Math.round(recFps)+'  треков '+tracker.tracks.length;
+  if(kind==='pc')return 'UA: '+navigator.userAgent.slice(0,90)+'\nрежим: ПК '+(pc.info?pc.info.device+' · '+pc.info.model+(pc.info.half?' fp16':'')+' · '+(pc.info.track||''):'-')+'  связь '+(pc.up?'есть':'нет')+'\nкадр '+pcDims(video.videoWidth,video.videoHeight).join('×')+' '+Math.round(pc.kb)+' КБ  в пути '+pc.jobs.size+'/'+PC_MAX+'  видео '+video.videoWidth+'×'+video.videoHeight+'\nзадержка показа '+Math.round(ageMs)+' мс  туда-обратно '+Math.round(pc.rtt)+' ±'+Math.round(pc.jit)+' мс  на ПК '+Math.round(pc.srv)+' мс  сжатие '+Math.round(pc.enc)+' мс  потеряно '+pc.lost+'\nкадров с рамками/с '+pc.viewFps.toFixed(1)+'  ответов/с '+detRate.toFixed(1)+'  камеры '+Math.round(camFps)+'  экрана '+Math.round(fps)+'  записи '+Math.round(recFps);
   return 'UA: '+navigator.userAgent.slice(0,90)+'\nядра: '+(navigator.hardwareConcurrency||'?')+'  память: '+(navigator.deviceMemory||'?')+' ГБ  GPU: '+(glInfo||'?')+'  WebGPU: '+(navigator.gpu?'да':'нет')+'\nрежим: '+LABEL[kind]+'×'+detectors.length+' потоков '+threads+' изоляция '+(ISO?'да':'нет')+' модель '+MODELS[MKEY].name+' вход '+inputDims(MKEY,clean.width,clean.height).join('×')+'  видео '+video.videoWidth+'×'+video.videoHeight+'\nинференс '+Math.round(inferMs)+' мс  детекций/с '+detRate.toFixed(1)+'  возраст кадра при результате '+Math.round(ageMs)+' мс\nFPS экрана '+Math.round(fps)+'  камеры '+Math.round(camFps)+'  записи '+Math.round(recFps)+'  треков '+tracker.tracks.length;
 }
 if(DIAG)diagEl.hidden=false;
@@ -372,7 +372,7 @@ async function fallbackDetector(){
 }
 
 function fakeDetector(base,jit){
-  return {async detect(g){const ms=jit?base*(1-jit+2*jit*Math.random()):base;await sleep(ms);return {dets:window.__fakeDets(clean,g&&g.iw||SIZE,g&&g.ih||SIZE,g),ms};},close(){}};
+  return {async detect(g){const ms=jit?base*(1-jit+2*jit*Math.random()):base;const dets=window.__fakeDets(clean,g&&g.iw||SIZE,g&&g.ih||SIZE,g);await sleep(ms);return {dets,ms};},close(){}};
 }
 function addWorkers(){
   if(kind==='fake'){if(PARAMS.has('workers'))for(let i=detectors.length;i<POOL;i++){const d=fakeDetector(parseInt(PARAMS.get('fakedet'))||250,0.4);detectors.push(d);detectLoop(d);}return;}
@@ -396,6 +396,7 @@ setInterval(()=>{const t=performance.now();if(ws&&((up&&wait&&t-wait>6000)||(!up
 self.onmessage=async e=>{
 const m=e.data;
 if(m.type==='init'){url=m.url;q=m.q;connect();return;}
+if(m.type==='text'){if(up&&ws&&ws.readyState===1)ws.send(m.text);return;}
 if(m.type!=='frame')return;
 const b=m.bmp;
 try{
@@ -417,56 +418,118 @@ self.postMessage({type:'sent',id:m.id,bytes:jpg.length,enc:performance.now()-t0}
 }catch(err){self.postMessage({type:'fail',id:m.id});}
 finally{try{b.close();}catch(err){}}
 };`;
-const pc={w:null,up:false,seq:0,jobs:new Map(),info:null,srv:0,enc:0,kb:0,rtt:0,lost:0};
+const PC_MAX=Math.max(1,Math.min(6,parseInt(PARAMS.get('pcn'))||4));
+const pc={w:null,up:false,seq:0,jobs:new Map(),info:null,srv:0,enc:0,kb:0,rtt:0,jit:0,lost:0,queue:[],view:null,viewN:0,viewFps:0,showT:0,stats:null,trails:new Map()};
 function pcDims(vw,vh){const s=Math.min(1,PC_PX/Math.max(vw,vh,1));return [Math.max(2,Math.round(vw*s/2)*2),Math.max(2,Math.round(vh*s/2)*2)];}
-function pcFinish(id,dets){const j=pc.jobs.get(id);if(!j)return;pc.jobs.delete(id);clearTimeout(j.timer);j.res(dets);}
+function pcModeOk(cls){return mode==='all'||(mode==='person')===(cls==='person');}
+function pcDrop(id){const j=pc.jobs.get(id);if(!j)return;pc.jobs.delete(id);clearTimeout(j.timer);if(j.disp)j.disp.close();}
+function pcText(o){if(pc.w&&pc.up)pc.w.postMessage({type:'text',text:JSON.stringify(o)});}
+function pcCfg(){pcText({cfg:{zones,lines,mode}});}
+function pcReset(){pc.trails.clear();pcText({reset:1});}
 function pcStart(){
   const url=(location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws';
   pc.w=new Worker(URL.createObjectURL(new Blob([NET_SRC],{type:'text/javascript'})));
   pc.w.onmessage=ev=>{
     const m=ev.data;
-    if(m.type==='open'){pc.up=true;return;}
-    if(m.type==='close'){pc.up=false;for(const id of [...pc.jobs.keys()])pcFinish(id,null);if(running)toast('Нет связи с ПК, переподключаюсь…',0);return;}
-    if(m.type==='fail'){pcFinish(m.id,null);return;}
+    if(m.type==='open'){pc.up=true;pcCfg();return;}
+    if(m.type==='close'){pc.up=false;for(const id of [...pc.jobs.keys()])pcDrop(id);if(running)toast('Нет связи с ПК, переподключаюсь…',0);return;}
+    if(m.type==='fail'){pcDrop(m.id);return;}
     if(m.type==='sent'){pc.kb=pc.kb?pc.kb*0.9+m.bytes/1024*0.1:m.bytes/1024;pc.enc=pc.enc?pc.enc*0.9+m.enc*0.1:m.enc;return;}
     if(m.type!=='msg')return;
     let r;try{r=JSON.parse(m.text);}catch(e){return;}
     if(r.hello){pc.info=r;toast('ПК подключён · '+r.device+' · '+r.model,2000);return;}
     const j=pc.jobs.get(r.id);
     if(!j)return;
-    if(r.skip||!r.d){pcFinish(r.id,null);return;}
+    pc.jobs.delete(r.id);clearTimeout(j.timer);
+    if(r.skip||!r.t||!j.disp||(pc.view&&j.ts<=pc.view.ts)){if(j.disp)j.disp.close();return;}
+    const now=performance.now(),rtt=now-j.ts;
+    pc.jit=pc.rtt?pc.jit*0.9+Math.abs(rtt-pc.rtt)*0.1:0;
+    pc.rtt=pc.rtt?pc.rtt*0.9+rtt*0.1:rtt;
     pc.srv=pc.srv?pc.srv*0.9+r.ms*0.1:r.ms;
-    pcFinish(r.id,r.d.map(a=>({cls:a[0],score:a[1],box:[a[2]*j.vw,a[3]*j.vh,a[4]*j.vw,a[5]*j.vh]})));
+    detN++;
+    pc.queue.push({bmp:j.disp,ts:j.ts,vw:j.vw,vh:j.vh,tracks:r.t,stats:r.s});
+    pc.queue.sort((x,y)=>x.ts-y.ts);
+    while(pc.queue.length>8)pc.queue.shift().bmp.close();
   };
   pc.w.postMessage({type:'init',url,q:PC_Q});
 }
-async function pcSend(vw,vh){
+function pcPump(){
+  if(!pc.up||document.hidden||pc.jobs.size>=PC_MAX)return;
+  const vw=video.videoWidth,vh=video.videoHeight;
+  if(!vw||!vh)return;
   const [w,h]=pcDims(vw,vh);
-  let bmp=null;
-  try{bmp=await createImageBitmap(clean,{resizeWidth:w,resizeHeight:h,resizeQuality:'medium'});}
-  catch(e){try{bmp=await createImageBitmap(clean);}catch(e2){bmp=null;}}
-  if(!bmp)return null;
   const id=++pc.seq;
-  return new Promise(res=>{
-    pc.jobs.set(id,{res,vw,vh,timer:setTimeout(()=>{pc.lost++;pcFinish(id,null);},2500)});
-    pc.w.postMessage({type:'frame',id,bmp,w,h},[bmp]);
+  const job={ts:performance.now(),vw,vh,disp:null};
+  job.timer=setTimeout(()=>{pc.lost++;pcDrop(id);},2500);
+  pc.jobs.set(id,job);
+  const dp=createImageBitmap(video);
+  const sp=createImageBitmap(video,{resizeWidth:w,resizeHeight:h,resizeQuality:'medium'}).catch(()=>createImageBitmap(video));
+  Promise.allSettled([dp,sp]).then(([a,b])=>{
+    const d=a.status==='fulfilled'?a.value:null,sb=b.status==='fulfilled'?b.value:null;
+    if(!d||!sb||pc.jobs.get(id)!==job){if(d)d.close();if(sb)sb.close();pcDrop(id);return;}
+    job.disp=d;
+    pc.w.postMessage({type:'frame',id,bmp:sb,w,h},[sb]);
   });
 }
-async function pcLoop(slot){
-  while(running&&detectors.includes(slot)){
-    if(!pc.up||document.hidden||!(video.readyState>=2&&video.videoWidth&&clean.width>2)){await sleep(50);continue;}
-    if(!await claimFrame(slot))return;
-    const ts=cleanTs,vw=clean.width,vh=clean.height,t0=performance.now();
-    const dets=await pcSend(vw,vh);
-    const now=performance.now();
-    slot.doneAt=now;
-    if(!dets)continue;
-    pc.rtt=pc.rtt?pc.rtt*0.8+(now-t0)*0.2:now-t0;
-    inferMs=pc.rtt;
-    ageMs=ageMs?ageMs*0.8+(now-ts)*0.2:(now-ts);
-    detN++;
-    tracker.update(dets.filter(d=>d.box[2]>1&&d.box[3]>1),ts,now,null);
+function pcView(v,now){
+  for(const t of v.tracks){
+    if(t[7])continue;
+    const c=[(t[3]+t[5]/2)*v.vw,(t[4]+t[6]/2)*v.vh,now];
+    let tr=pc.trails.get(t[0]);
+    if(!tr){tr=[];pc.trails.set(t[0],tr);}
+    const last=tr[tr.length-1];
+    if(!last||Math.hypot(c[0]-last[0],c[1]-last[1])>=3)tr.push(c);
+    while(tr.length&&(now-tr[0][2]>5000||tr.length>160))tr.shift();
   }
+  for(const [id,tr] of pc.trails)if(!tr.length||now-tr[tr.length-1][2]>5000)pc.trails.delete(id);
+  const s=v.stats;
+  if(!s)return;
+  pc.stats=s;
+  if(Array.isArray(s.z))zoneStats=zones.map((z,i)=>({inside:s.z[i]?s.z[i][0]:0,entered:s.z[i]?s.z[i][1]:0}));
+  if(Array.isArray(s.l))lineStats=lines.map((l,i)=>({in:s.l[i]?s.l[i][0]:0,out:s.l[i]?s.l[i][1]:0}));
+}
+function renderPC(vw,vh){
+  const now=performance.now();
+  const mirror=facing==='user';
+  if(newFrame||now-lastVF>500){newFrame=false;lastVF=now;armVF();pcPump();}
+  const D=Math.min(400,Math.max(30,pc.rtt+2*pc.jit+10));
+  let pick=-1;
+  for(let i=0;i<pc.queue.length;i++)if(pc.queue[i].ts+D<=now)pick=i;
+  if(pick>=0){
+    for(let i=0;i<pick;i++)pc.queue[i].bmp.close();
+    const nv=pc.queue[pick];
+    pc.queue.splice(0,pick+1);
+    if(pc.view)pc.view.bmp.close();
+    pc.view=nv;pc.viewN++;pc.showT=now;
+    ageMs=ageMs?ageMs*0.8+(now-nv.ts)*0.2:(now-nv.ts);
+    pcView(nv,now);
+  }
+  const v=pc.view&&now-pc.showT<1000?pc.view:null;
+  const W=v?v.vw:vw,H=v?v.vh:vh;
+  if(canvas.width!==W||canvas.height!==H){canvas.width=W;canvas.height=H;}
+  ctx.save();
+  if(mirror){ctx.translate(W,0);ctx.scale(-1,1);}
+  ctx.drawImage(v?v.bmp:video,0,0,W,H);
+  ctx.restore();
+  const S=Math.max(1,W/640);
+  drawShapes(ctx,overlayShapes(W,H,mirror,S),1);
+  let nP=0,nA=0;
+  if(v)for(const t of v.tracks){
+    if(!pcModeOk(t[1]))continue;
+    if(t[1]==='person')nP++;else nA++;
+    let x=t[3]*W;const y=t[4]*H,w=t[5]*W,h=t[6]*H;
+    if(mirror)x=W-x-w;
+    drawBox(ctx,x,y,w,h,{id:t[0],cls:t[1],score:t[2],peak:t[2]},S);
+  }
+  updatePanel(now,nP,nA);
+  if(DIAG&&now-diagT>500){diagT=now;diagEl.textContent=diagText(now);}
+  if(recorder&&now-recFrameT>=recInt){recFrameT=now;if(recMode==='worker')feedRecW(W,H,false,S);else feedRec(W,H,false,S);}
+  fpsN++;
+  if(now-fpsT>=1000){const el=now-fpsT;fps=fpsN*1000/el;camFps=camN*1000/el;detRate=detN*1000/el;recFps=recorder?recN*1000/el:0;pc.viewFps=pc.viewN*1000/el;fpsN=camN=detN=recN=pc.viewN=0;fpsT=now;if(recorder)adaptRec();}
+  const ct=mode==='person'?'ЛЮДЕЙ: '+nP:mode==='animal'?'ЖИВОТНЫХ: '+nA:'ЛЮДЕЙ: '+nP+'  ЖИВОТНЫХ: '+nA;
+  if(ct!==cntText){cntText=ct;cnt.textContent=ct;}
+  const pt=(pc.up?Math.round(pc.viewFps)+' FPS · '+Math.round(ageMs)+'мс · ПК·'+(pc.info?pc.info.model.replace(/^yolo/,''):'')+' · '+detRate.toFixed(1)+'/с':Math.round(fps)+' FPS · нет связи с ПК')+(recorder?' · зап '+Math.round(recFps):'');
+  if(pt!==perfText){perfText=pt;perf.textContent=pt;}
 }
 
 function errText(e){return e&&e.message?e.message:String(e);}
@@ -498,6 +561,7 @@ async function openCamera(){
   newFrame=true;armVF();
   if(!video.videoWidth){await Promise.race([new Promise(r=>video.addEventListener('loadedmetadata',r,{once:true})),sleep(4000)]);}
   tracker.reset();
+  if(kind==='pc')pcReset();
   try{localStorage.setItem('facing',facing);}catch(e){}
 }
 
@@ -1054,7 +1118,7 @@ for(const kv of (PARAMS.get('trk')||'').split(',')){const [k,v]=kv.split(':');if
 const tracker=createTracker(Object.assign(PARAMS.has('nofeat')?{}:{feature:featureOf},TRK));
 const panel=$('panel'),panelSum=$('panelSum'),panelList=$('panelList'),editHint=$('editHint');
 function saveFx(){try{localStorage.setItem('fx',JSON.stringify(FX));}catch(e){}}
-function saveGeo(){try{localStorage.setItem('zones',JSON.stringify(zones));localStorage.setItem('lines',JSON.stringify(lines));}catch(e){}}
+function saveGeo(){try{localStorage.setItem('zones',JSON.stringify(zones));localStorage.setItem('lines',JSON.stringify(lines));}catch(e){}if(kind==='pc')pcCfg();}
 function fxButtons(){$('fxTrails').classList.toggle('on',FX.trails);$('fxLabels').classList.toggle('on',FX.labels);$('fxZones').classList.toggle('on',FX.zones);$('addZone').classList.toggle('edit',editMode==='zone');$('addLine').classList.toggle('edit',editMode==='line');}
 function setEdit(m){editMode=editMode===m?'':m;drag=null;fxButtons();editHint.hidden=!editMode;editHint.textContent=editMode==='zone'?'Проведите пальцем по кадру, чтобы нарисовать зону. Тап по зоне удаляет её':'Проведите линию. Тап по линии удаляет её';}
 $('fxTrails').addEventListener('click',()=>{FX.trails=!FX.trails;saveFx();fxButtons();});
@@ -1099,7 +1163,7 @@ let panelT=0,panelText='';
 function updatePanel(now,nP,nA){
   if(now-panelT<250)return;
   panelT=now;
-  const st=tracker.stats();
+  const st=kind==='pc'?{unique:pc.stats?pc.stats.u:0,reid:pc.stats?pc.stats.r:0}:tracker.stats();
   const sum=' люди '+nP+' · животные '+nA+' · всего '+st.unique+(st.reid?' · возвр. '+st.reid:'');
   if(sum!==panelText){panelText=sum;panelSum.textContent=sum;}
   if(!panelOpen)return;
@@ -1112,7 +1176,8 @@ function updatePanel(now,nP,nA){
 function overlayShapes(vw,vh,mirror,S){
   const out={polys:[],rects:[],texts:[]};
   const mx=x=>mirror?vw-x:x;
-  if(FX.trails)for(const t of tracker.tracks){
+  if(FX.trails&&kind==='pc'){if(pc.view)for(const t of pc.view.tracks){if(!pcModeOk(t[1]))continue;const tr=pc.trails.get(t[0]);if(!tr||tr.length<2)continue;out.polys.push({pts:tr.map(c=>[mx(c[0]),c[1]]),color:idColor(t[0]),w:2*S,fade:true});}}
+  else if(FX.trails)for(const t of tracker.tracks){
     if(!visible(t)||t.trail.length<2)continue;
     out.polys.push({pts:t.trail.map(c=>[mx(c[0]),c[1]]),color:idColor(t.id),w:2*S,fade:true});
   }
@@ -1136,7 +1201,7 @@ function drawShapes(c,sh,k){
   for(const r of sh.rects){c.strokeStyle=r.color;c.lineWidth=r.w2*k;c.setLineDash([8*k,6*k]);c.strokeRect(r.x*k,r.y*k,r.w*k,r.h*k);c.setLineDash([]);c.fillStyle=r.color;c.globalAlpha=0.08;c.fillRect(r.x*k,r.y*k,r.w*k,r.h*k);c.globalAlpha=1;}
   for(const t of sh.texts){c.font='600 '+(12*t.s*k)+'px ui-monospace,Menlo,Consolas,monospace';c.textBaseline='alphabetic';c.fillStyle='rgba(0,0,0,0.55)';const w=c.measureText(t.text).width;c.fillRect(t.x*k-3*k,t.y*k-12*t.s*k,w+6*k,15*t.s*k);c.fillStyle=t.color;c.fillText(t.text,t.x*k,t.y*k);}
 }
-if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;window.__recStat=REC_STAT;}
+if(new URLSearchParams(location.search).has('debug')){window.__tracker=tracker;window.__clean=clean;window.__recStat=REC_STAT;window.__pc=pc;}
 
 async function detectLoop(det){
   let cycle=0;
@@ -1220,25 +1285,16 @@ function verifyNext(det,now){
   }).catch(()=>{}).finally(()=>{verifyBusy=false;});
 }
 
-function boxColor(t){return idColor(t.id);}
+const BOX_COLOR='#39ff7a';
+function boxColor(t){return BOX_COLOR;}
 function boxLabel(t){return FX.labels?'#'+t.id+' '+labelOf(t)+' '+Math.round(t.score*100)+'%':'#'+t.id;}
 function drawBox(ctx,x,y,w,h,t,s){
   const color=boxColor(t);
-  if(t.miss>1)ctx.globalAlpha=0.6;
-  ctx.strokeStyle=color;
-  ctx.globalAlpha=0.55;
-  ctx.lineWidth=1.5*s;
-  ctx.strokeRect(x,y,w,h);
   ctx.globalAlpha=1;
-  const L=Math.min(w,h)*0.22;
-  ctx.lineWidth=4*s;
-  ctx.lineCap='square';
-  ctx.beginPath();
-  ctx.moveTo(x,y+L);ctx.lineTo(x,y);ctx.lineTo(x+L,y);
-  ctx.moveTo(x+w-L,y);ctx.lineTo(x+w,y);ctx.lineTo(x+w,y+L);
-  ctx.moveTo(x+w,y+h-L);ctx.lineTo(x+w,y+h);ctx.lineTo(x+w-L,y+h);
-  ctx.moveTo(x+L,y+h);ctx.lineTo(x,y+h);ctx.lineTo(x,y+h-L);
-  ctx.stroke();
+  ctx.strokeStyle=color;
+  ctx.lineWidth=2.5*s;
+  ctx.lineJoin='miter';
+  ctx.strokeRect(x,y,w,h);
   const label=boxLabel(t);
   ctx.font='600 '+(14*s)+'px ui-monospace,Menlo,Consolas,monospace';
   const tw=ctx.measureText(label).width+12*s;
@@ -1257,6 +1313,7 @@ function render(){
   requestAnimationFrame(render);
   const vw=video.videoWidth,vh=video.videoHeight;
   if(!vw||!vh)return;
+  if(kind==='pc'){renderPC(vw,vh);return;}
   if(canvas.width!==vw||canvas.height!==vh){canvas.width=vw;canvas.height=vh;}
   const now=performance.now();
   const dt=Math.min(100,now-lastFrame);lastFrame=now;
@@ -1307,6 +1364,7 @@ function render(){
   if(pt!==perfText){perfText=pt;perf.textContent=pt;}
 }
 function feedRec(vw,vh,mirror,S){
+  if(kind==='pc'){rctx.drawImage(canvas,0,0,rc.width,rc.height);if(recTrack)recTrack.requestFrame();recN++;return;}
   const rs=rc.width/vw;
   const a=performance.now();
   rctx.save();
@@ -1344,6 +1402,7 @@ function setMode(m){
   mode=m;
   for(const b of modes.children)b.classList.toggle('on',b.dataset.mode===m);
   try{localStorage.setItem('mode',m);}catch(e){}
+  if(kind==='pc')pcCfg();
 }
 modes.addEventListener('click',e=>{const b=e.target.closest('button');if(b)setMode(b.dataset.mode);});
 setMode(mode);
@@ -1415,10 +1474,7 @@ function drawShapes(c,sh,k){
   for(const t of sh.texts){c.font='600 '+(12*t.s*k)+'px ui-monospace,Menlo,Consolas,monospace';c.textBaseline='alphabetic';c.fillStyle='rgba(0,0,0,0.55)';const w=c.measureText(t.text).width;c.fillRect(t.x*k-3*k,t.y*k-12*t.s*k,w+6*k,15*t.s*k);c.fillStyle=t.color;c.fillText(t.text,t.x*k,t.y*k);}
 }
 function drawBox(x,y,w,h,color,label,s){
-  cx.strokeStyle=color;cx.globalAlpha=0.55;cx.lineWidth=1.5*s;cx.strokeRect(x,y,w,h);cx.globalAlpha=1;
-  const L=Math.min(w,h)*0.22;cx.lineWidth=4*s;cx.lineCap='square';cx.beginPath();
-  cx.moveTo(x,y+L);cx.lineTo(x,y);cx.lineTo(x+L,y);cx.moveTo(x+w-L,y);cx.lineTo(x+w,y);cx.lineTo(x+w,y+L);
-  cx.moveTo(x+w,y+h-L);cx.lineTo(x+w,y+h);cx.lineTo(x+w-L,y+h);cx.moveTo(x+L,y+h);cx.lineTo(x,y+h);cx.lineTo(x,y+h-L);cx.stroke();
+  cx.globalAlpha=1;cx.strokeStyle=color;cx.lineWidth=2.5*s;cx.lineJoin='miter';cx.strokeRect(x,y,w,h);
   cx.font='600 '+(14*s)+'px ui-monospace,Menlo,Consolas,monospace';
   const tw=cx.measureText(label).width+12*s,th=22*s,ly=y-th-4*s<0?y+4*s:y-th-4*s;
   cx.fillStyle='rgba(0,0,0,0.6)';cx.fillRect(x,ly,tw,th);cx.fillStyle=color;cx.textBaseline='middle';cx.fillText(label,x+6*s,ly+th/2);
@@ -1475,6 +1531,16 @@ function finishRec(blob,type){
 }
 function feedRecW(vw,vh,mirror,S){
   if(!recWReady||recInFlight>=2)return;
+  if(kind==='pc'){
+    const ts=performance.now()-recStart;
+    recInFlight++;
+    createImageBitmap(canvas,{resizeWidth:rc.width,resizeHeight:rc.height,resizeQuality:'low'}).catch(()=>createImageBitmap(canvas)).then(bmp=>{
+      recInFlight--;
+      if(!recW||recMode!=='worker'){bmp.close();return;}
+      recW.postMessage({type:'frame',bmp,boxes:[],shapes:null,k:1,ts},[bmp]);recN++;
+    }).catch(()=>{recInFlight--;});
+    return;
+  }
   const rs=rc.width/vw;
   const boxes=[];
   for(const t of tracker.tracks){
@@ -1507,7 +1573,7 @@ function startRecWorker(){
     else if(m.type==='error'){recCodec=false;if(recorder){toast('Ошибка записи');finishRec(null,'');}}
   };
   recW.onerror=()=>{recCodec=false;if(recorder){toast('Ошибка записи');finishRec(null,'');}};
-  recW.postMessage({type:'init',w:rc.width,h:rc.height,mirror:facing==='user',codec:recCodec,bps:L.bps,fps:Math.round(1000/recInt)});
+  recW.postMessage({type:'init',w:rc.width,h:rc.height,mirror:facing==='user'&&kind!=='pc',codec:recCodec,bps:L.bps,fps:Math.round(1000/recInt)});
   recMode='worker';
   recorder={state:'recording',mimeType:'video/mp4',stop(){this.state='inactive';if(recW)recW.postMessage({type:'stop'});},onstop(){}};
 }
@@ -1615,9 +1681,7 @@ go.addEventListener('click',async()=>{
   if(PCMODE){
     kind='pc';
     pcStart();
-    detectors=[{doneAt:0,close(){}},{doneAt:0,close(){}}];
     toast('Подключаюсь к ПК…',0);
-    for(const d of detectors)pcLoop(d);
     return;
   }
   toast('Загружаю нейросеть…',0);
